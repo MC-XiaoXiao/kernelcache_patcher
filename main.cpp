@@ -13,14 +13,11 @@
 
 using namespace tinyxml2;
 
-/**
- * 首先，要从Kernel中读取信息
- */
-
 void format_prelink_info(KernelMacho& kernel);
 Kext* load_kext_from_file(const char* path);
 uint32_t get_filesize(std::ifstream& fd);
 const char* getValueFromDict(XMLElement* dictElem, const char* keyName);
+void init_kext_depends(KernelMacho& kernel, Kext* kext);
 void useage();
 
 int main(int argc, char** argv)
@@ -89,19 +86,18 @@ int main(int argc, char** argv)
             y_kernel.kexts.push_back(kext);
         } else if ((kext = i_kernel.find_kext(kext_paths[i])) != NULL) {
             // Kext 在Kernelcache中
-            
+
             printf("ID: %s\n", kext->kext_id);
             y_kernel.kexts.push_back(kext);
         } else {
             printf("Not found kext %s\n", kext_paths[i]);
+            exit(1);
         }
     }
-    
-    for (auto kext : y_kernel.kexts)
-    {
-        printf("%s\n", kext->kext_id);
+
+    for (auto kext : y_kernel.kexts) {
+        init_kext_depends(y_kernel, kext);
     }
-    
 }
 
 void format_prelink_info(KernelMacho& kernel)
@@ -129,14 +125,28 @@ void format_prelink_info(KernelMacho& kernel)
             XMLElement* rootArray = rootDict->FirstChildElement("array");
             XMLElement* kextNode = rootArray->FirstChildElement("dict");
             printf("iOS kernelcache has %d kexts\n", rootArray->ChildElementCount());
+
+            const char* kext_id_list[1000];
+
             while (kextNode) {
+                XMLElement* tmpElement = kextNode->FirstChildElement("key");
+                while (tmpElement) {
+                    tmpElement = tmpElement->NextSiblingElement();
+                    if (tmpElement->Attribute("ID")) {
+                        kext_id_list[tmpElement->IntAttribute("ID")] = tmpElement->GetText();
+                    } else if (tmpElement->Attribute("IDREF")) {
+                        int id = tmpElement->IntAttribute("IDREF");
+                        if (kext_id_list[id]) {
+                            tmpElement->SetText(kext_id_list[id]);
+                        }
+                    }
+
+                    tmpElement = tmpElement->NextSiblingElement("key");
+                }
+
                 Kext* kext = new Kext();
-                //char kextID[255];
-                //strcpy(kextID, getValueFromDict(kextNode, "CFBundleIdentifier"));
-                // kernel.kexts[getValueFromDict(kextNode, "CFBundleIdentifier")] = kext;
                 kext->kext_id = getValueFromDict(kextNode, "CFBundleIdentifier");
                 kernel.kexts.push_back(kext);
-                // printf("%s\n", getValueFromDict(kextNode, "CFBundleIdentifier"));
 
                 kextNode = kextNode->NextSiblingElement();
             }
@@ -144,26 +154,56 @@ void format_prelink_info(KernelMacho& kernel)
     }
 }
 
+XMLElement* plist_get_item(XMLElement* elm, const char* keyName)
+{
+    if (!elm)
+        return NULL;
+    XMLElement* keyElem = elm->FirstChildElement("key");
+
+    while (keyElem) {
+        if (keyElem->GetText()) {
+            if (!strcmp(keyElem->GetText(), keyName)) {
+                if (keyElem->NextSiblingElement()) {
+                    return keyElem->NextSiblingElement();
+                }
+            }
+        }
+        keyElem = keyElem->NextSiblingElement("key");
+    }
+
+    return NULL;
+}
+
 const char* getValueFromDict(XMLElement* dictElem, const char* keyName)
 {
     const char* result = NULL;
     if (!dictElem)
         return NULL;
-    dictElem = dictElem->FirstChildElement("key");
-    while (dictElem) {
-        if (dictElem->GetText()) {
-            if (!strcmp(dictElem->GetText(), keyName)) {
-                if (dictElem->NextSiblingElement()) {
-                    result = dictElem->NextSiblingElement()->GetText();
-                    break;
-                }
-            }
-        }
 
-        dictElem = dictElem->NextSiblingElement("key");
+    dictElem = plist_get_item(dictElem, keyName);
+    if (!dictElem) {
+        return NULL;
     }
 
+    result = dictElem->GetText();
+
     return result;
+}
+
+void init_kext_depends(KernelMacho& kernel, Kext* kext)
+{
+    XMLElement* depes_el = plist_get_item(kext->kextInfoElement, "OSBundleLibraries");
+    if (!depes_el)
+        return;
+    XMLElement* depend_cld = depes_el->FirstChildElement("key");
+
+    Kext* depend_kext;
+    while (depend_cld) {
+        depend_kext = kernel.find_kext(depend_cld->GetText());
+        printf("dep: %s, %p\n", depend_cld->GetText(), depend_kext);
+
+        depend_cld = depend_cld->NextSiblingElement("key");
+    }
 }
 
 Kext* load_kext_from_file(const char* path)
@@ -191,10 +231,12 @@ Kext* load_kext_from_file(const char* path)
     KextMacho* kext_file = new KextMacho(kext_exec_path);
     kext->from_file = true;
     kext->exec_file = kext_file;
+
     std::ifstream kext_info_fd(kext_info_path, std::ios::binary);
     char* kext_info_buf = (char*)malloc(get_filesize(kext_info_fd));
     kext_info_fd.read(kext_info_buf, get_filesize(kext_info_fd));
 
+    // tinyxml2 无法解析xml doctype定义，跳过这部分
     while (*kext_info_buf++) {
         if (!strncmp(kext_info_buf, "<dict>", 6)) {
             break;

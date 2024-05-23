@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include <tinyxml2.h>
 
 #include <KextMacho.h>
@@ -14,6 +16,7 @@ public:
     XMLDocument kextInfoDoc;
     XMLElement *kextInfoElement;
     KextMacho *exec_file;
+    std::vector<Kext *> depends;
     const char *kext_id;
     char *exec_buf;
     bool from_file;
