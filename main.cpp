@@ -16,7 +16,8 @@ using namespace tinyxml2;
 void format_prelink_info(KernelMacho& kernel);
 Kext* load_kext_from_file(const char* path);
 uint32_t get_filesize(std::ifstream& fd);
-const char* getValueFromDict(XMLElement* dictElem, const char* keyName);
+const char* plist_get_string(XMLElement* dictElem, const char* keyName);
+uint64_t plist_get_uint64(XMLElement* dictElem, const char* keyName);
 void init_kext_depends(KernelMacho& kernel, Kext* kext);
 void useage();
 
@@ -54,7 +55,10 @@ int main(int argc, char** argv)
     KernelMacho i_kernel(ios_kernel_path);
 
     y_kernel.format_macho();
+    y_kernel.init_symbols();
+
     i_kernel.format_macho();
+    i_kernel.init_symbols();
     format_prelink_info(i_kernel);
 
     std::ifstream symbol_list_fs(symbol_list_path);
@@ -69,7 +73,7 @@ int main(int argc, char** argv)
     while (kexts_list_fs.getline(kext_path, PATH_LENGTH)) {
         if (kext_path[0] == '#' || kext_path[0] == ' ')
             continue;
-        char *tmp_kext_path = (char *)malloc(strlen(kext_path) + 1);
+        char* tmp_kext_path = (char*)malloc(strlen(kext_path) + 1);
         memset(tmp_kext_path, 0, strlen(kext_path));
         strcpy(tmp_kext_path, kext_path);
         kext_paths.push_back(tmp_kext_path);
@@ -79,7 +83,7 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < kext_paths.size(); i++) {
         char kext_dir[PATH_LENGTH];
         sprintf(kext_dir, "%s/%s", kexts_path, kext_paths[i]);
-        printf("%s\n", kext_paths[i]);
+
         Kext* kext = load_kext_from_file(kext_dir);
         if (kext) {
             // Kext 在文件夹中
@@ -100,6 +104,9 @@ int main(int argc, char** argv)
     for (auto kext : y_kernel.kexts) {
         printf("Loading : %s\n", kext->kext_id);
         init_kext_depends(y_kernel, kext);
+        if (kext->exec_file) {
+            kext->exec_file->init_symbols();
+        }
     }
 }
 
@@ -149,9 +156,21 @@ void format_prelink_info(KernelMacho& kernel)
                 }
 
                 Kext* kext = new Kext();
-                // Kext* kext = (Kext *)malloc(sizeof(Kext));
+                // printf("0x%016llx\n", plist_get_uint64(kextNode, "_PrelinkExecutableLoadAddr"));
+                uint64_t kext_vmaddr = plist_get_uint64(kextNode, "_PrelinkExecutableLoadAddr");
+                // 找到文件偏移量
+                if (kext_vmaddr) {
+                    segment_command_64_t* prelink_text = (segment_command_64_t*)kernel.find_segment("__PRELINK_TEXT");
+                    uint64_t prelink_text_base = prelink_text->vmaddr;
+                    uint64_t kext_fileoff = (uint64_t)kernel.file_buf + kext_vmaddr - prelink_text_base + prelink_text->fileoff;
+                    // printf("off: 0x%016x\n", kext_vmaddr - prelink_text_base + prelink_text->fileoff);
+
+                    KextMacho* kext_macho = new KextMacho((char*)kext_fileoff, 0);
+                    kext_macho->format_macho();
+                    kext->exec_file = kext_macho;
+                }
                 kext->kextInfoElement = kextNode;
-                kext->kext_id = getValueFromDict(kextNode, "CFBundleIdentifier");
+                kext->kext_id = plist_get_string(kextNode, "CFBundleIdentifier");
                 kernel.kexts.push_back(kext);
 
                 kextNode = kextNode->NextSiblingElement();
@@ -180,7 +199,27 @@ XMLElement* plist_get_item(XMLElement* elm, const char* keyName)
     return NULL;
 }
 
-const char* getValueFromDict(XMLElement* dictElem, const char* keyName)
+uint64_t plist_get_uint64(XMLElement* dictElem, const char* keyName)
+{
+    uint64_t result = 0;
+    if (!dictElem)
+        return 0;
+
+    dictElem = plist_get_item(dictElem, keyName);
+    if (!dictElem) {
+        return 0;
+    }
+
+    if (!dictElem->GetText()) {
+        return 0;
+    }
+
+    result = std::stoull(dictElem->GetText(), NULL, 16);
+
+    return result;
+}
+
+const char* plist_get_string(XMLElement* dictElem, const char* keyName)
 {
     const char* result = NULL;
     if (!dictElem)
@@ -207,7 +246,7 @@ void init_kext_depends(KernelMacho& kernel, Kext* kext)
     while (depend_cld) {
         depend_kext = kernel.find_kext(depend_cld->GetText());
         printf("....dep: %s, %p\n", depend_cld->GetText(), depend_kext);
-        if(depend_kext == NULL) {
+        if (depend_kext == NULL) {
             printf("Not found kext depend %s\n", depend_cld->GetText());
             exit(1);
         }
@@ -243,11 +282,12 @@ Kext* load_kext_from_file(const char* path)
     KextMacho* kext_file = new KextMacho(kext_exec_path);
     kext->from_file = true;
     kext->exec_file = kext_file;
+    kext_file->format_macho();
 
     std::ifstream kext_info_fd(kext_info_path, std::ios::binary);
     char* kext_info_buf = (char*)malloc(get_filesize(kext_info_fd));
     kext_info_fd.read(kext_info_buf, get_filesize(kext_info_fd));
-    char *tmp_buf = kext_info_buf;
+    char* tmp_buf = kext_info_buf;
 
     // tinyxml2 无法解析xml doctype定义，跳过这部分
     while (*tmp_buf++) {
@@ -266,7 +306,7 @@ Kext* load_kext_from_file(const char* path)
         return NULL;
     }
 
-    kext->kext_id = getValueFromDict(kext->kextInfoElement, "CFBundleIdentifier");
+    kext->kext_id = plist_get_string(kext->kextInfoElement, "CFBundleIdentifier");
 
     return kext;
 }

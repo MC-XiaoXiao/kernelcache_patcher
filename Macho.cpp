@@ -3,17 +3,41 @@
 #include <cstring>
 #include <iostream>
 
+void Macho::init_symbols()
+{
+    struct symtab_command* k_symtab = (struct symtab_command*)find_command(LC_SYMTAB);
+    if (!k_symtab) {
+        return;
+    }
+
+    struct nlist_64* sym_list = (struct nlist_64*)((uint64_t)this->file_buf + k_symtab->symoff);
+    symbol_count = k_symtab->nsyms;
+    void* symstr = (void*)((uint64_t)file_buf + k_symtab->stroff);
+    printf("Mach-o has %d symbols\n", symbol_count);
+
+    for (int i = 0; i < symbol_count; i++) {
+            Symbol* sym = new Symbol();
+            sym->symbol_addr = sym_list[i].n_value;
+            sym->symbol_name = (const char*)((uint64_t)symstr + sym_list[i].n_un.n_strx);
+            
+            if(sym->symbol_addr) {
+                symbol_addr_map[sym->symbol_addr] = sym;
+            }
+            if(sym->symbol_name) {
+                symbol_name_map[sym->symbol_name] = sym;
+            }
+            symbol_list.push_back(sym);
+    }
+}
+
 void Macho::format_macho()
 {
-    printf("Formating %s\n", file_path);
+    // printf("Formating %s\n", file_path);
 
     header = (mach_header_64_t*)file_buf;
 
     if (header->magic == MH_MAGIC_64) {
         is_64 = true;
-#if DEBUG
-        printf("Macho: 64bit Kernel!\n");
-#endif
     } else if (header->magic == MH_MAGIC) {
         is_64 = false;
     } else {
@@ -44,13 +68,33 @@ uint32_t Macho::get_file_size()
     return result;
 }
 
+void* Macho::find_command(uint32_t cmd)
+{
+    load_command* lcd = NULL;
+    if (is_64) {
+        lcd = (load_command*)(header + 1);
+    } else {
+        lcd = (load_command*)((mach_header_t*)header + 1);
+    }
+
+    for (int i = 0; i < header->ncmds; i++) {
+        if (lcd->cmd == cmd) {
+            return lcd;
+        }
+
+        lcd = (load_command*)((uint64_t)lcd + lcd->cmdsize);
+    }
+
+    return NULL;
+}
+
 void* Macho::find_segment(const char* segment_name)
 {
     load_command* lcd = NULL;
-    if(is_64) {
-        lcd = (load_command *)(header + 1);
+    if (is_64) {
+        lcd = (load_command*)(header + 1);
     } else {
-        lcd = (load_command *)((mach_header_t *)header + 1);
+        lcd = (load_command*)((mach_header_t*)header + 1);
     }
     for (int i = 0; i < header->ncmds; i++) {
         if (is_64) {
@@ -77,7 +121,12 @@ void* Macho::find_segment(const char* segment_name)
 
 Macho::Macho()
 {
+}
 
+Macho::Macho(char* buf, uint32_t file_size)
+    : file_buf(buf)
+    , file_size(file_size)
+{
 }
 
 Macho::Macho(const char* path)
@@ -94,6 +143,7 @@ Macho::Macho(const char* path)
         file_size = get_file_size();
         file_buf = (char*)malloc(file_size);
         filefs.read(file_buf, file_size);
+        filefs.close();
     }
 }
 
