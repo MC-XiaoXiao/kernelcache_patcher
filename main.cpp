@@ -67,9 +67,10 @@ int main(int argc, char** argv)
     std::vector<const char*> kext_paths;
     char kext_path[PATH_LENGTH];
     while (kexts_list_fs.getline(kext_path, PATH_LENGTH)) {
-        if (kext_path[0] == '#')
+        if (kext_path[0] == '#' || kext_path[0] == ' ')
             continue;
-        char* tmp_kext_path = (char*)malloc(strlen(kext_path));
+        char *tmp_kext_path = (char *)malloc(strlen(kext_path) + 1);
+        memset(tmp_kext_path, 0, strlen(kext_path));
         strcpy(tmp_kext_path, kext_path);
         kext_paths.push_back(tmp_kext_path);
     }
@@ -78,16 +79,17 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < kext_paths.size(); i++) {
         char kext_dir[PATH_LENGTH];
         sprintf(kext_dir, "%s/%s", kexts_path, kext_paths[i]);
+        printf("%s\n", kext_paths[i]);
         Kext* kext = load_kext_from_file(kext_dir);
         if (kext) {
             // Kext 在文件夹中
-            printf("ID: %s\n", kext->kext_id);
+            // printf("ID: %s\n", kext->kext_id);
             // y_kernel.kexts[kext_ID] = kext;
             y_kernel.kexts.push_back(kext);
         } else if ((kext = i_kernel.find_kext(kext_paths[i])) != NULL) {
             // Kext 在Kernelcache中
 
-            printf("ID: %s\n", kext->kext_id);
+            // printf("ID: %s\n", kext->kext_id);
             y_kernel.kexts.push_back(kext);
         } else {
             printf("Not found kext %s\n", kext_paths[i]);
@@ -96,6 +98,7 @@ int main(int argc, char** argv)
     }
 
     for (auto kext : y_kernel.kexts) {
+        printf("Loading : %s\n", kext->kext_id);
         init_kext_depends(y_kernel, kext);
     }
 }
@@ -115,6 +118,7 @@ void format_prelink_info(KernelMacho& kernel)
             if (kernel.prlink_info_doc.ErrorID()) {
                 printf("Error to parse prelink(%d)\n", kernel.prlink_info_doc.ErrorID());
             }
+            free(prelink_info_buf);
 
             XMLElement* rootDict = kernel.prlink_info_doc.FirstChildElement("dict");
             if (strcmp(rootDict->FirstChildElement("key")->GetText(), "_PrelinkInfoDictionary")) {
@@ -145,6 +149,8 @@ void format_prelink_info(KernelMacho& kernel)
                 }
 
                 Kext* kext = new Kext();
+                // Kext* kext = (Kext *)malloc(sizeof(Kext));
+                kext->kextInfoElement = kextNode;
                 kext->kext_id = getValueFromDict(kextNode, "CFBundleIdentifier");
                 kernel.kexts.push_back(kext);
 
@@ -200,7 +206,12 @@ void init_kext_depends(KernelMacho& kernel, Kext* kext)
     Kext* depend_kext;
     while (depend_cld) {
         depend_kext = kernel.find_kext(depend_cld->GetText());
-        printf("dep: %s, %p\n", depend_cld->GetText(), depend_kext);
+        printf("....dep: %s, %p\n", depend_cld->GetText(), depend_kext);
+        if(depend_kext == NULL) {
+            printf("Not found kext depend %s\n", depend_cld->GetText());
+            exit(1);
+        }
+        kext->depends.push_back(depend_kext);
 
         depend_cld = depend_cld->NextSiblingElement("key");
     }
@@ -226,8 +237,9 @@ Kext* load_kext_from_file(const char* path)
         return NULL;
     }
 
-    printf("Load KEXT %s\n", kext_name);
+    // printf("Load KEXT %s\n", kext_name);
     Kext* kext = new Kext();
+    // Kext *kext = (Kext *)malloc(sizeof(Kext));
     KextMacho* kext_file = new KextMacho(kext_exec_path);
     kext->from_file = true;
     kext->exec_file = kext_file;
@@ -235,16 +247,20 @@ Kext* load_kext_from_file(const char* path)
     std::ifstream kext_info_fd(kext_info_path, std::ios::binary);
     char* kext_info_buf = (char*)malloc(get_filesize(kext_info_fd));
     kext_info_fd.read(kext_info_buf, get_filesize(kext_info_fd));
+    char *tmp_buf = kext_info_buf;
 
     // tinyxml2 无法解析xml doctype定义，跳过这部分
-    while (*kext_info_buf++) {
-        if (!strncmp(kext_info_buf, "<dict>", 6)) {
+    while (*tmp_buf++) {
+        if (!strncmp(tmp_buf, "<dict>", 6)) {
             break;
         }
     }
-    if (kext->kextInfoDoc.Parse(kext_info_buf)) {
+    if (kext->kextInfoDoc.Parse(tmp_buf)) {
         return NULL;
     }
+    free(kext_info_buf);
+    kext_info_fd.close();
+
     kext->kextInfoElement = kext->kextInfoDoc.FirstChildElement();
     if (!kext->kextInfoElement) {
         return NULL;
