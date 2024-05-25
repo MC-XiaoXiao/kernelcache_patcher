@@ -14,6 +14,7 @@ private:
 public:
     std::vector<Kext *> kexts;
     XMLDocument prlink_info_doc;
+    uint64_t prelink_text_base;
 
     virtual void format_macho() override;
 

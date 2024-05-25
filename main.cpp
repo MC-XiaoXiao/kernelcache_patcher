@@ -18,6 +18,7 @@ using namespace tinyxml2;
 void format_prelink_info(KernelMacho& kernel);
 Kext* load_kext_from_file(const char* path);
 uint32_t get_filesize(std::ifstream& fd);
+XMLElement* plist_get_item(XMLElement* elm, const char* keyName);
 const char* plist_get_string(XMLElement* dictElem, const char* keyName);
 uint64_t plist_get_uint64(XMLElement* dictElem, const char* keyName);
 void init_kext_depends(KernelMacho& kernel, Kext* kext);
@@ -215,6 +216,30 @@ XMLElement* new_plist_elem(XMLDocument* doc, XMLElement* ins_ele, const char* ty
     return value;
 }
 
+void plist_add_int(XMLDocument* doc, XMLElement* elem, const char* name, uint64_t value, uint32_t size)
+{
+    XMLElement* valueElem;
+    char tmp_str[20];
+    char tmp_format[20];
+    // if (size == 64)
+    //     sprintf(tmp_format, "0x%%%dllx", size / 4);
+    // else if (size == 32)
+    //     sprintf(tmp_format, "0x%%%dx", size / 4);
+    sprintf(tmp_format, "0xllx");
+    // printf("%s\n", tmp_format);
+
+    sprintf(tmp_str, "0x%llx", value);
+    // printf("%s\n", tmp_str);
+
+    if ((valueElem = plist_get_item(elem, name))) {
+        valueElem->SetText(tmp_str);
+    } else {
+        XMLElement* new_elem = new_plist_elem(doc, elem, "integer", name);
+        new_elem->SetAttribute("size", 64);
+        new_elem->SetText(tmp_str);
+    }
+}
+
 uint64_t make_prelink_info(KernelMacho& kernel)
 {
     uint64_t prelink_size = 0;
@@ -225,12 +250,24 @@ uint64_t make_prelink_info(KernelMacho& kernel)
     XMLElement* root_array = new_plist_elem(prelink_info_doc, root_dict, "array", "_PrelinkInfoDictionary");
 
     for (auto kext : kernel.kexts) {
-        root_array->InsertEndChild(kext->kextInfoElement->DeepClone(prelink_info_doc));
+        XMLNode* kext_element = kext->kextInfoElement->DeepClone(prelink_info_doc);
+        plist_add_int(prelink_info_doc, kext_element->ToElement(),
+            "_PrelinkExecutableLoadAddr", kernel.prelink_text_base + kext->text_off, 64);
+
+        if (kext->exec_macho) {
+            plist_add_int(prelink_info_doc, kext_element->ToElement(),
+                "_PrelinkExecutableSize", kext->exec_macho->file_size, 64);
+        }
+        plist_add_int(prelink_info_doc, kext_element->ToElement(),
+            "_PrelinkExecutableSourceAddr", kernel.prelink_text_base + kext->text_off, 64);
+        // printf("%p\n", kernel.prelink_text_base + kext->text_off);
+        root_array->InsertEndChild(kext_element);
     }
 
     XMLPrinter streamer;
     prelink_info_doc->Print(&streamer);
-    // printf("%s", streamer.CStr());
+
+    printf("%s", streamer.CStr());
     return prelink_size;
 }
 
@@ -310,6 +347,8 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
         new_prelink_data_base = new_prelink_data_const_base - prelink_data_size;
         new_prelink_text_exec_base = new_prelink_data_base - prelink_text_exec_size;
         new_prelink_text_base = new_prelink_text_exec_base - prelink_text_size;
+
+        y_kernel.prelink_text_base = new_prelink_text_base;
         printf("Prelink text will at 0x%016llx\n", new_prelink_text_base);
 
         for (auto kext : y_kernel.kexts) {
@@ -428,9 +467,11 @@ void format_prelink_info(KernelMacho& kernel)
                     KextMacho* kext_macho = new KextMacho((char*)kext_fileoff, 0);
                     kext_macho->format_macho();
                     kext->exec_macho = kext_macho;
+                    kext->exec_macho->file_size = plist_get_uint64(kextNode, "_PrelinkExecutableSize");
                 }
                 kext->kextInfoElement = kextNode;
                 kext->kext_id = plist_get_string(kextNode, "CFBundleIdentifier");
+
                 kernel.kexts.push_back(kext);
 
                 kextNode = kextNode->NextSiblingElement();
