@@ -11,6 +11,8 @@
 
 #define PATH_LENGTH 255
 
+#define ALIGN_UP(x, y) (((x) + (y)) & ~((y) - 1))
+
 using namespace tinyxml2;
 
 void format_prelink_info(KernelMacho& kernel);
@@ -19,6 +21,7 @@ uint32_t get_filesize(std::ifstream& fd);
 const char* plist_get_string(XMLElement* dictElem, const char* keyName);
 uint64_t plist_get_uint64(XMLElement* dictElem, const char* keyName);
 void init_kext_depends(KernelMacho& kernel, Kext* kext);
+void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl);
 void useage();
 
 int main(int argc, char** argv)
@@ -104,8 +107,279 @@ int main(int argc, char** argv)
     for (auto kext : y_kernel.kexts) {
         printf("Loading : %s\n", kext->kext_id);
         init_kext_depends(y_kernel, kext);
-        if (kext->exec_file) {
-            kext->exec_file->init_symbols();
+        if (kext->exec_macho) {
+            kext->exec_macho->init_symbols();
+        }
+    }
+
+    patch_kext_to_kernel(y_kernel, i_kernel);
+}
+
+uint32_t get_prelink_text_size(KernelMacho& kernel)
+{
+    uint32_t size = 0;
+    for (auto kext : kernel.kexts) {
+        if (kext->exec_macho) {
+            segment_command_64_t* text_seg = (segment_command_64_t*)(kext->exec_macho->find_segment("__TEXT"));
+            if (text_seg) {
+                size += (text_seg->vmsize + (1 << 4)) & ~((1 << 4) - 1);
+            } else if (kext->exec_macho->header) {
+                if (kext->exec_macho->header->sizeofcmds) {
+                    size += ALIGN_UP(kext->exec_macho->header->sizeofcmds, 1 << 4);
+                }
+            }
+        }
+    }
+
+    return size;
+}
+
+uint32_t get_prelink_segment_size(KernelMacho& kernel, const char* seg_name)
+{
+    uint32_t size = 0;
+
+    for (auto kext : kernel.kexts) {
+        if (kext->exec_macho) {
+            segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment(seg_name));
+            if (text_exec_seg) {
+                size += ALIGN_UP(text_exec_seg->vmsize, 1 << 4);
+            }
+        }
+    }
+
+    return size;
+}
+
+void copy_segment_from_kext(Kext* kext, KernelMacho& i_kerenl, const char* kext_segname, const char* kernel_segname, void* buf, uint64_t& off)
+{
+    uint64_t copy_des = 0;
+    uint64_t copy_src = 0;
+    uint64_t copy_size = 0;
+
+    segment_command_64_t* i_seg = (segment_command_64_t*)(i_kerenl.find_segment(kernel_segname));
+
+    segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment(kext_segname));
+    if (text_exec_seg) {
+        if (kext->from_file) {
+            copy_src = (uint64_t)kext->exec_macho->file_buf + text_exec_seg->fileoff;
+        } else {
+            copy_src = text_exec_seg->vmaddr;
+            copy_src -= i_seg->vmaddr;
+            copy_src += (uint64_t)i_kerenl.file_buf + i_seg->fileoff;
+        }
+        copy_size = ALIGN_UP(text_exec_seg->vmsize, 1 << 4);
+        copy_des = (uint64_t)buf + off;
+
+        // printf("Copy 0x%016llx -> 0x%016llx(0x%08x)\n", copy_src, off, copy_size);
+
+        memcpy((char*)copy_des, (char*)copy_src, copy_size);
+        off += copy_size;
+    }
+}
+
+void patch_seg_vmbase(segment_command_64_t* seg, uint64_t vmaddr, uint64_t size)
+{
+    uint64_t old_vmbase = seg->vmaddr;
+    seg->vmaddr = vmaddr;
+    seg->vmsize = size;
+
+    section_64_t* sect = (section_64_t*)((uint64_t)seg + sizeof(segment_command_64_t));
+    for (int i = 0; i < seg->nsects; i++) {
+        sect->addr = vmaddr + sect->addr - old_vmbase;
+        sect = (section_64_t*)(sect + 1);
+    }
+}
+
+void patch_seg_base(segment_command_64_t* seg, uint64_t fileoff, uint64_t vmaddr, uint64_t size)
+{
+    patch_seg_vmbase(seg, vmaddr, size);
+    seg->fileoff = fileoff;
+    seg->filesize = size;
+
+    section_64_t* sect = (section_64_t*)((uint64_t)seg + sizeof(segment_command_64_t));
+    sect->offset = fileoff;
+    sect->size = size;
+}
+
+XMLElement* new_plist_elem(XMLDocument* doc, XMLElement* ins_ele, const char* type_name, const char* key_name)
+{
+    XMLElement* key = doc->NewElement("key");
+    key->SetText(key_name);
+    XMLElement* value = doc->NewElement(type_name);
+
+    if (ins_ele) {
+        ins_ele->InsertFirstChild(key);
+        ins_ele->InsertAfterChild(key, value);
+    }
+
+    return value;
+}
+
+uint64_t make_prelink_info(KernelMacho& kernel)
+{
+    uint64_t prelink_size = 0;
+    XMLDocument* prelink_info_doc = new XMLDocument();
+    XMLElement* root_dict = prelink_info_doc->NewElement("dict");
+
+    prelink_info_doc->InsertFirstChild(root_dict);
+    XMLElement* root_array = new_plist_elem(prelink_info_doc, root_dict, "array", "_PrelinkInfoDictionary");
+
+    for (auto kext : kernel.kexts) {
+        root_array->InsertEndChild(kext->kextInfoElement->DeepClone(prelink_info_doc));
+    }
+
+    XMLPrinter streamer;
+    prelink_info_doc->Print(&streamer);
+    // printf("%s", streamer.CStr());
+    return prelink_size;
+}
+
+void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
+{
+    if (y_kernel.is_newer_ver) {
+        uint32_t prelink_text_size = get_prelink_text_size(y_kernel);
+        uint32_t prelink_text_exec_size = get_prelink_segment_size(y_kernel, "__TEXT_EXEC");
+        uint32_t prelink_data_size = get_prelink_segment_size(y_kernel, "__DATA");
+        uint32_t prelink_data_const_size = get_prelink_segment_size(y_kernel, "__DATA_CONST");
+
+        printf("pre text size: %x\n", prelink_text_size);
+        printf("pre text exec size: %x\n", prelink_text_exec_size);
+        printf("pre data size: %x\n", prelink_data_size);
+        printf("pre data const size: %x\n", prelink_data_const_size);
+
+        void* prelink_text_buf = calloc(sizeof(char), prelink_text_size);
+        void* prelink_text_exec_buf = calloc(sizeof(char), prelink_text_exec_size);
+        void* prelink_data_buf = calloc(sizeof(char), prelink_data_size);
+        void* prelink_data_const_buf = calloc(sizeof(char), prelink_data_const_size);
+
+        // 将对应kext拷贝到目标段缓冲区中
+        uint64_t kerenl_text_off = 0;
+        uint64_t kerenl_text_exec_off = 0;
+        uint64_t kerenl_data_off = 0;
+        uint64_t kerenl_data_const_off = 0;
+        uint32_t size = 0;
+
+        for (auto kext : y_kernel.kexts) {
+            if (kext->exec_macho) {
+                kext->text_off = kerenl_text_off;
+                segment_command_64_t* text_seg = (segment_command_64_t*)(kext->exec_macho->find_segment("__TEXT"));
+                if (text_seg && text_seg->filesize > 0) {
+                    memcpy((char*)((uint64_t)prelink_text_buf + kerenl_text_off),
+                        (char*)(uint64_t)kext->exec_macho->file_buf + text_seg->fileoff,
+                        text_seg->filesize);
+                    // printf("Copy 0x%016llx -> 0x%016llx\n", text_seg->fileoff, kerenl_text_off);
+                    kerenl_text_off += (text_seg->filesize + (1 << 4)) & ~((1 << 4) - 1);
+                } else {
+                    if (kext->exec_macho->header->sizeofcmds) {
+                        size = (kext->exec_macho->header->sizeofcmds + (1 << 4)) & ~((1 << 4) - 1);
+                        memcpy((char*)((uint64_t)prelink_text_buf + kerenl_text_off),
+                            (char*)(uint64_t)kext->exec_macho->file_buf,
+                            size);
+
+                        kerenl_text_off += size;
+                    }
+                }
+                kext->text_exec_off = kerenl_text_exec_off;
+                copy_segment_from_kext(kext, i_kerenl, "__TEXT_EXEC", "__PLK_TEXT_EXEC", prelink_text_exec_buf, kerenl_text_exec_off);
+                kext->data_off = kerenl_data_off;
+                copy_segment_from_kext(kext, i_kerenl, "__DATA", "__PRELINK_DATA", prelink_data_buf, kerenl_data_off);
+                kext->data_const_off = kerenl_data_const_off;
+                copy_segment_from_kext(kext, i_kerenl, "__DATA_CONST", "__PLK_DATA_CONST", prelink_data_const_buf, kerenl_data_const_off);
+            }
+        }
+
+        prelink_text_size = ALIGN_UP(prelink_text_size, 1 << 13);
+        prelink_text_exec_size = ALIGN_UP(prelink_text_exec_size, 1 << 13);
+        prelink_data_size = ALIGN_UP(prelink_data_size, 1 << 13);
+        prelink_data_const_size = ALIGN_UP(prelink_data_const_size, 1 << 13);
+
+        // 重新设定头部地址
+        // 先计算各段基址
+        uint64_t new_prelink_text_base = 0;
+        uint64_t new_prelink_text_exec_base = 0;
+        uint64_t new_prelink_data_base = 0;
+        uint64_t new_prelink_data_const_base = 0;
+        segment_command_64_t* y_text_segment = (segment_command_64_t*)(y_kernel.find_segment("__TEXT"));
+        segment_command_64_t* y_prelink_text_segment = (segment_command_64_t*)(y_kernel.find_segment("__PRELINK_TEXT"));
+        segment_command_64_t* y_prelink_text_exec_segment = (segment_command_64_t*)(y_kernel.find_segment("__PLK_TEXT_EXEC"));
+        segment_command_64_t* y_prelink_data_segment = (segment_command_64_t*)(y_kernel.find_segment("__PRELINK_DATA"));
+        segment_command_64_t* y_prelink_data_const_segment = (segment_command_64_t*)(y_kernel.find_segment("__PLK_DATA_CONST"));
+
+        uint64_t kernel_text_vmbase = y_text_segment->vmaddr;
+        new_prelink_data_const_base = kernel_text_vmbase - prelink_data_const_size;
+        new_prelink_data_base = new_prelink_data_const_base - prelink_data_size;
+        new_prelink_text_exec_base = new_prelink_data_base - prelink_text_exec_size;
+        new_prelink_text_base = new_prelink_text_exec_base - prelink_text_size;
+        printf("Prelink text will at 0x%016llx\n", new_prelink_text_base);
+
+        for (auto kext : y_kernel.kexts) {
+            if (kext->exec_macho) {
+                if (kext->exec_macho->find_segment("__TEXT")) {
+                    mach_header_64_t* new_hdr = (mach_header_64_t*)((uint64_t)prelink_text_buf + kext->text_off);
+                    struct load_command* lcd = (struct load_command*)(new_hdr + 1);
+                    for (int i = 0; i < new_hdr->ncmds; i++) {
+                        if (lcd->cmd == LC_SEGMENT_64) {
+                            segment_command_64_t* seg = (segment_command_64_t*)lcd;
+                            if (!strncmp(seg->segname, "__TEXT", 16))
+                                patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_base + kext->text_off, seg->filesize);
+                            else if (!strncmp(seg->segname, "__TEXT_EXEC", 16))
+                                patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_exec_base + kext->text_exec_off, seg->filesize);
+                            else if (!strncmp(seg->segname, "__DATA", 16))
+                                patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_base + kext->data_off, seg->filesize);
+                            else if (!strncmp(seg->segname, "__DATA", 16))
+                                patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_const_base + kext->data_const_off, seg->filesize);
+                        } else if (lcd->cmd == LC_SEGMENT) {
+                        }
+                        lcd = (struct load_command*)((uint64_t)lcd + lcd->cmdsize);
+                    }
+                }
+            }
+        }
+
+        // 获取内核末尾
+        segment_command_64_t* linkedit_seg = (segment_command_64_t*)y_kernel.find_segment("__LINKEDIT");
+        uint64_t end_fileoff = linkedit_seg->fileoff + linkedit_seg->filesize;
+        end_fileoff = ALIGN_UP(end_fileoff, 1 << 13);
+        printf("End ad 0x%016llx\n", end_fileoff);
+        uint64_t new_prelink_text_fileoff = end_fileoff;
+        uint64_t new_prelink_text_exec_fileoff = new_prelink_text_fileoff + prelink_text_size;
+        uint64_t new_prelink_data_fileoff = new_prelink_text_exec_fileoff + prelink_text_exec_size;
+        uint64_t new_prelink_data_const_fileoff = new_prelink_data_fileoff + prelink_data_const_size;
+
+        // 修改内核基址
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_TEXT"), new_prelink_text_fileoff, new_prelink_text_base, prelink_text_size);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_TEXT_EXEC"), new_prelink_text_exec_fileoff, new_prelink_text_exec_base, prelink_text_exec_size);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_DATA"), new_prelink_data_fileoff, new_prelink_data_base, prelink_data_size);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_DATA_CONST"), new_prelink_data_const_fileoff, new_prelink_data_const_base, prelink_data_const_size);
+
+        make_prelink_info(y_kernel);
+    }
+}
+
+const char* kext_id_list[1000];
+
+void format_info_ids(XMLElement* kextsNode)
+{
+    if (kextsNode->ChildElementCount() > 0) {
+        XMLElement* tmpElement = kextsNode->FirstChildElement();
+        while (tmpElement) {
+            format_info_ids(tmpElement);
+            tmpElement = tmpElement->NextSiblingElement();
+        }
+    } else {
+        XMLElement* tmpElement = kextsNode;
+        if (tmpElement->Attribute("ID")) {
+            kext_id_list[tmpElement->IntAttribute("ID")] = tmpElement->GetText();
+            tmpElement->DeleteAttribute("ID");
+        } else if (tmpElement->Attribute("IDREF")) {
+            int id = tmpElement->IntAttribute("IDREF");
+            if (kext_id_list[id]) {
+                tmpElement->SetText(kext_id_list[id]);
+                tmpElement->DeleteAttribute("IDREF");
+            } else {
+                tmpElement->SetText("");
+                tmpElement->DeleteAttribute("IDREF");
+            }
         }
     }
 }
@@ -138,23 +412,9 @@ void format_prelink_info(KernelMacho& kernel)
             printf("iOS kernelcache has %d kexts\n", rootArray->ChildElementCount());
 
             const char* kext_id_list[1000];
+            format_info_ids(rootArray);
 
             while (kextNode) {
-                XMLElement* tmpElement = kextNode->FirstChildElement("key");
-                while (tmpElement) {
-                    tmpElement = tmpElement->NextSiblingElement();
-                    if (tmpElement->Attribute("ID")) {
-                        kext_id_list[tmpElement->IntAttribute("ID")] = tmpElement->GetText();
-                    } else if (tmpElement->Attribute("IDREF")) {
-                        int id = tmpElement->IntAttribute("IDREF");
-                        if (kext_id_list[id]) {
-                            tmpElement->SetText(kext_id_list[id]);
-                        }
-                    }
-
-                    tmpElement = tmpElement->NextSiblingElement("key");
-                }
-
                 Kext* kext = new Kext();
                 // printf("0x%016llx\n", plist_get_uint64(kextNode, "_PrelinkExecutableLoadAddr"));
                 uint64_t kext_vmaddr = plist_get_uint64(kextNode, "_PrelinkExecutableLoadAddr");
@@ -167,7 +427,7 @@ void format_prelink_info(KernelMacho& kernel)
 
                     KextMacho* kext_macho = new KextMacho((char*)kext_fileoff, 0);
                     kext_macho->format_macho();
-                    kext->exec_file = kext_macho;
+                    kext->exec_macho = kext_macho;
                 }
                 kext->kextInfoElement = kextNode;
                 kext->kext_id = plist_get_string(kextNode, "CFBundleIdentifier");
@@ -281,7 +541,7 @@ Kext* load_kext_from_file(const char* path)
     // Kext *kext = (Kext *)malloc(sizeof(Kext));
     KextMacho* kext_file = new KextMacho(kext_exec_path);
     kext->from_file = true;
-    kext->exec_file = kext_file;
+    kext->exec_macho = kext_file;
     kext_file->format_macho();
 
     std::ifstream kext_info_fd(kext_info_path, std::ios::binary);

@@ -15,11 +15,15 @@ private:
 public:
     XMLDocument kextInfoDoc;
     XMLElement *kextInfoElement;
-    KextMacho *exec_file;
+    KextMacho *exec_macho;
     std::vector<Kext *> depends;
     const char *kext_id;
-    char *exec_buf;
     bool from_file;
+
+    uint64_t text_off;
+    uint64_t text_exec_off;
+    uint64_t data_off;
+    uint64_t data_const_off;
 
     Kext(/* args */);
     ~Kext();

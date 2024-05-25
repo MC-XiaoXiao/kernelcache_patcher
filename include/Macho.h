@@ -14,7 +14,7 @@ typedef struct mach_header {
 	uint32_t	ncmds;		/* number of load commands */
 	uint32_t	sizeofcmds;	/* the size of all the load commands */
 	uint32_t	flags;		/* flags */
-}mach_header_t;
+} mach_header_t;
 
 #define	MH_MAGIC	0xfeedface	/* the mach magic number */
 
@@ -71,6 +71,22 @@ typedef struct segment_command_64 { /* for 64-bit architectures */
 	uint32_t	nsects;		/* number of sections in segment */
 	uint32_t	flags;		/* flags */
 } segment_command_64_t;
+
+typedef struct section_64
+{                       /* for 64-bit architectures */
+    char sectname[16];  /* name of this section */
+    char segname[16];   /* segment this section goes in */
+    uint64_t addr;      /* memory address of this section */
+    uint64_t size;      /* size in bytes of this section */
+    uint32_t offset;    /* file offset of this section */
+    uint32_t align;     /* section alignment (power of 2) */
+    uint32_t reloff;    /* file offset of relocation entries */
+    uint32_t nreloc;    /* number of relocation entries */
+    uint32_t flags;     /* flags (section type and attributes)*/
+    uint32_t reserved1; /* reserved (for offset or index) */
+    uint32_t reserved2; /* reserved (for count or sizeof) */
+    uint32_t reserved3; /* reserved */
+} section_64_t;
 
 struct symtab_command
 {
@@ -250,7 +266,7 @@ public:
     void init_symbols();
     void copy_from_file(uint64_t offset, char *targetBuff, size_t size);
     void *find_segment(const char *segment_name);
-	void *find_command(uint32_t cmd);
+	load_command *find_command(uint32_t cmd);
 
 	Macho();
 	Macho(char *buf, uint32_t file_size);

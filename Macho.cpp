@@ -68,7 +68,7 @@ uint32_t Macho::get_file_size()
     return result;
 }
 
-void* Macho::find_command(uint32_t cmd)
+load_command* Macho::find_command(uint32_t cmd)
 {
     load_command* lcd = NULL;
     if (is_64) {
