@@ -127,10 +127,10 @@ uint32_t get_prelink_text_size(KernelMacho& kernel)
         if (kext->exec_macho) {
             segment_command_64_t* text_seg = (segment_command_64_t*)(kext->exec_macho->find_segment("__TEXT"));
             if (text_seg) {
-                size += (text_seg->vmsize + (1 << 4)) & ~((1 << 4) - 1);
+                size += ALIGN_UP(text_seg->vmsize, 1 << 5);
             } else if (kext->exec_macho->header) {
                 if (kext->exec_macho->header->sizeofcmds) {
-                    size += ALIGN_UP(kext->exec_macho->header->sizeofcmds, 1 << 4);
+                    size += ALIGN_UP(kext->exec_macho->header->sizeofcmds, 1 << 5);
                 }
             }
         }
@@ -147,7 +147,7 @@ uint32_t get_prelink_segment_size(KernelMacho& kernel, const char* seg_name)
         if (kext->exec_macho) {
             segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment(seg_name));
             if (text_exec_seg) {
-                size += ALIGN_UP(text_exec_seg->vmsize, 1 << 4);
+                size += ALIGN_UP(text_exec_seg->vmsize, 1 << 5);
             }
         }
     }
@@ -172,7 +172,7 @@ void copy_segment_from_kext(Kext* kext, KernelMacho& i_kerenl, const char* kext_
             copy_src -= i_seg->vmaddr;
             copy_src += (uint64_t)i_kerenl.file_buf + i_seg->fileoff;
         }
-        copy_size = ALIGN_UP(text_exec_seg->vmsize, 1 << 4);
+        copy_size = ALIGN_UP(text_exec_seg->vmsize, 1 << 5);
         copy_des = (uint64_t)buf + off;
 
         // printf("Copy 0x%016llx -> 0x%016llx(0x%08x)\n", copy_src, off, copy_size);
@@ -180,6 +180,19 @@ void copy_segment_from_kext(Kext* kext, KernelMacho& i_kerenl, const char* kext_
         memcpy((char*)copy_des, (char*)copy_src, copy_size);
         off += copy_size;
     }
+}
+
+void patch_seg_fileoff(segment_command_64_t *seg, uint64_t fileoff, uint64_t size)
+{
+    section_64_t* sect = (section_64_t*)((uint64_t)seg + sizeof(segment_command_64_t));
+    for (int i = 0; i < seg->nsects; i++) {
+        sect->offset = sect->offset - seg->fileoff + fileoff;
+        sect = (section_64_t*)(sect + 1);
+    }
+
+
+    seg->fileoff = fileoff;
+    seg->filesize = size;
 }
 
 void patch_seg_vmbase(segment_command_64_t* seg, uint64_t vmaddr, uint64_t size)
@@ -319,10 +332,10 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                         (char*)(uint64_t)kext->exec_macho->file_buf + text_seg->fileoff,
                         text_seg->filesize);
                     // printf("Copy 0x%016llx -> 0x%016llx\n", text_seg->fileoff, kerenl_text_off);
-                    kerenl_text_off += (text_seg->filesize + (1 << 4)) & ~((1 << 4) - 1);
+                    kerenl_text_off += ALIGN_UP(text_seg->filesize, 1 << 5);
                 } else {
                     if (kext->exec_macho->header->sizeofcmds) {
-                        size = (kext->exec_macho->header->sizeofcmds + (1 << 4)) & ~((1 << 4) - 1);
+                        size = ALIGN_UP(kext->exec_macho->header->sizeofcmds, 1 << 5);
                         memcpy((char*)((uint64_t)prelink_text_buf + kerenl_text_off),
                             (char*)(uint64_t)kext->exec_macho->file_buf,
                             size);
@@ -376,7 +389,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
         uint64_t new_prelink_data_const_fileoff = new_prelink_text_exec_fileoff + prelink_text_exec_size;
         printf("data const off: %p\n", new_prelink_data_const_fileoff);
         uint64_t new_prelink_data_fileoff = new_prelink_data_const_fileoff + prelink_data_const_size;
-    
 
         // 修改Kext符号表
         for (auto kext : y_kernel.kexts) {
@@ -430,8 +442,8 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
         patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_LINKEDIT"), new_prelink_info_fileoff, new_prelink_info_base, 0);
         patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_INFO"), new_prelink_info_fileoff, new_prelink_info_base, prelink_info_size);
 
-
         // 修改Kext段基址
+        // 20240526: fileoff也要修改
         for (auto kext : y_kernel.kexts) {
             if (kext->exec_macho) {
                 if (kext->exec_macho->find_segment("__TEXT")) {
@@ -440,16 +452,23 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                     for (int i = 0; i < new_hdr->ncmds; i++) {
                         if (lcd->cmd == LC_SEGMENT_64) {
                             segment_command_64_t* seg = (segment_command_64_t*)lcd;
-                            if (!strncmp(seg->segname, "__TEXT", 16))
+                            if (!strncmp(seg->segname, "__TEXT", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_base + kext->text_off, seg->filesize);
-                            else if (!strncmp(seg->segname, "__TEXT_EXEC", 16))
-                                patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_exec_base + kext->text_exec_off, seg->filesize);
-                            else if (!strncmp(seg->segname, "__DATA", 16))
+                            } else if (!strncmp(seg->segname, "__TEXT_EXEC", 16)) {
+                                patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_exec_base + kext->text_exec_off, seg->vmsize);
+
+                                patch_seg_fileoff((segment_command_64_t *)lcd, (new_prelink_text_exec_fileoff + kext->text_exec_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
+                                printf("%p -- %p\n", (kerenl_text_exec_off + kext->text_exec_off), (new_prelink_text_fileoff + kext->text_off));
+                            } else if (!strncmp(seg->segname, "__DATA", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_base + kext->data_off, seg->filesize);
-                            else if (!strncmp(seg->segname, "__DATA_CONST", 16))
+                                patch_seg_fileoff((segment_command_64_t *)lcd, (new_prelink_data_fileoff + kext->data_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
+                            } else if (!strncmp(seg->segname, "__DATA_CONST", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_const_base + kext->data_const_off, seg->filesize);
-                            else if (!strncmp(seg->segname, "__LINKEDIT", 16))
+                                patch_seg_fileoff((segment_command_64_t *)lcd, (new_prelink_data_const_fileoff + kext->data_const_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
+                            } else if (!strncmp(seg->segname, "__LINKEDIT", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_info_base, 0);
+                                patch_seg_fileoff((segment_command_64_t *)lcd, new_prelink_info_fileoff, 0);
+                            }
                         } else if (lcd->cmd == LC_SEGMENT) {
                         }
                         lcd = (struct load_command*)((uint64_t)lcd + lcd->cmdsize);
@@ -458,7 +477,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
             }
         }
 
-        
         // 最后将段复制到内核中
         printf("New kernel filesize: 0x%x\n", new_kernel_size);
         y_kernel.file_buf = (char*)realloc(y_kernel.file_buf, new_kernel_size);
