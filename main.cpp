@@ -114,6 +114,10 @@ int main(int argc, char** argv)
     }
 
     patch_kext_to_kernel(y_kernel, i_kernel);
+
+    std::ofstream output_file_fs(output_path, std::ios::binary);
+    output_file_fs.write(y_kernel.file_buf, y_kernel.file_size);
+    output_file_fs.close();
 }
 
 uint32_t get_prelink_text_size(KernelMacho& kernel)
@@ -161,7 +165,7 @@ void copy_segment_from_kext(Kext* kext, KernelMacho& i_kerenl, const char* kext_
 
     segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment(kext_segname));
     if (text_exec_seg) {
-        if (kext->from_file) {
+        if (kext->is_from_file) {
             copy_src = (uint64_t)kext->exec_macho->file_buf + text_exec_seg->fileoff;
         } else {
             copy_src = text_exec_seg->vmaddr;
@@ -240,9 +244,9 @@ void plist_add_int(XMLDocument* doc, XMLElement* elem, const char* name, uint64_
     }
 }
 
-uint64_t make_prelink_info(KernelMacho& kernel)
+char* make_prelink_info(KernelMacho& kernel, uint64_t& info_size)
 {
-    uint64_t prelink_size = 0;
+    char* result = 0;
     XMLDocument* prelink_info_doc = new XMLDocument();
     XMLElement* root_dict = prelink_info_doc->NewElement("dict");
 
@@ -250,25 +254,35 @@ uint64_t make_prelink_info(KernelMacho& kernel)
     XMLElement* root_array = new_plist_elem(prelink_info_doc, root_dict, "array", "_PrelinkInfoDictionary");
 
     for (auto kext : kernel.kexts) {
-        XMLNode* kext_element = kext->kextInfoElement->DeepClone(prelink_info_doc);
-        plist_add_int(prelink_info_doc, kext_element->ToElement(),
-            "_PrelinkExecutableLoadAddr", kernel.prelink_text_base + kext->text_off, 64);
-
         if (kext->exec_macho) {
+            XMLNode* kext_element = kext->kextInfoElement->DeepClone(prelink_info_doc);
+            plist_add_int(prelink_info_doc, kext_element->ToElement(),
+                "_PrelinkExecutableLoadAddr", kernel.prelink_text_base + kext->text_off, 64);
+
             plist_add_int(prelink_info_doc, kext_element->ToElement(),
                 "_PrelinkExecutableSize", kext->exec_macho->file_size, 64);
+
+            plist_add_int(prelink_info_doc, kext_element->ToElement(),
+                "_PrelinkExecutableSourceAddr", kernel.prelink_text_base + kext->text_off, 64);
+            plist_add_int(prelink_info_doc, kext_element->ToElement(),
+                "_PrelinkKmodInfo", kext->kmod_addr, 64);
+            // printf("%p\n", kernel.prelink_text_base + kext->text_off);
+            root_array->InsertEndChild(kext_element);
         }
-        plist_add_int(prelink_info_doc, kext_element->ToElement(),
-            "_PrelinkExecutableSourceAddr", kernel.prelink_text_base + kext->text_off, 64);
-        // printf("%p\n", kernel.prelink_text_base + kext->text_off);
-        root_array->InsertEndChild(kext_element);
     }
 
     XMLPrinter streamer;
     prelink_info_doc->Print(&streamer);
 
-    printf("%s", streamer.CStr());
-    return prelink_size;
+    // printf("%s", streamer.CStr());
+    info_size = streamer.CStrSize();
+    info_size = ALIGN_UP(info_size, 1 << 13);
+    printf("Preinfo size: %x\n", info_size);
+    result = (char*)malloc(info_size);
+    const char* tmp = streamer.CStr();
+    memcpy((void*)result, tmp, info_size);
+    // printf("%s\n", (char *)result);
+    return result;
 }
 
 void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
@@ -341,16 +355,83 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
         segment_command_64_t* y_prelink_text_exec_segment = (segment_command_64_t*)(y_kernel.find_segment("__PLK_TEXT_EXEC"));
         segment_command_64_t* y_prelink_data_segment = (segment_command_64_t*)(y_kernel.find_segment("__PRELINK_DATA"));
         segment_command_64_t* y_prelink_data_const_segment = (segment_command_64_t*)(y_kernel.find_segment("__PLK_DATA_CONST"));
+        segment_command_64_t* y_linkedit_seg = (segment_command_64_t*)y_kernel.find_segment("__LINKEDIT");
 
         uint64_t kernel_text_vmbase = y_text_segment->vmaddr;
         new_prelink_data_const_base = kernel_text_vmbase - prelink_data_const_size;
-        new_prelink_data_base = new_prelink_data_const_base - prelink_data_size;
-        new_prelink_text_exec_base = new_prelink_data_base - prelink_text_exec_size;
+        new_prelink_data_base = ALIGN_UP(y_linkedit_seg->vmaddr + y_linkedit_seg->vmsize, 1 << 13);
+        new_prelink_text_exec_base = new_prelink_data_const_base - prelink_text_exec_size;
         new_prelink_text_base = new_prelink_text_exec_base - prelink_text_size;
 
         y_kernel.prelink_text_base = new_prelink_text_base;
         printf("Prelink text will at 0x%016llx\n", new_prelink_text_base);
+        printf("Prelink data will at 0x%016llx\n", new_prelink_data_base);
 
+        // 获取内核末尾
+        uint64_t end_fileoff = y_linkedit_seg->fileoff + y_linkedit_seg->filesize;
+        end_fileoff = ALIGN_UP(end_fileoff, 1 << 13);
+        printf("End ad 0x%016llx\n", end_fileoff);
+        uint64_t new_prelink_text_fileoff = end_fileoff;
+        uint64_t new_prelink_text_exec_fileoff = new_prelink_text_fileoff + prelink_text_size;
+        uint64_t new_prelink_data_const_fileoff = new_prelink_text_exec_fileoff + prelink_text_exec_size;
+        printf("data const off: %p\n", new_prelink_data_const_fileoff);
+        uint64_t new_prelink_data_fileoff = new_prelink_data_const_fileoff + prelink_data_const_size;
+    
+
+        // 修改Kext符号表
+        for (auto kext : y_kernel.kexts) {
+            // KMOD处理
+            if (kext->exec_macho) {
+                if (kext->is_from_file) {
+                    if (kext->exec_macho->find_segment("__TEXT")) {
+                        // printf(">>>>>>>>>>>>>>>>>%d\n", kext->exec_macho->symbol_name_map.find("_kmod_info") == kext->exec_macho->symbol_name_map.end());
+                        if (kext->exec_macho->symbol_name_map["_kmod_info"]) {
+                            segment_command_64_t* kext_data_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__DATA");
+                            kext->kmod_addr = kext->exec_macho->symbol_name_map["_kmod_info"]->symbol_addr - kext_data_seg->vmaddr;
+                            kext->kmod_addr += new_prelink_data_base + kext->data_off;
+                            printf("New kmod addr: %p\n", kext->kmod_addr);
+                        }
+                    } else {
+                        kext->kmod_addr = 0;
+                    }
+                } else {
+                    segment_command_64_t* kext_data_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__DATA");
+                    kext->kmod_addr = kext->kmod_addr - kext_data_seg->vmaddr + new_prelink_data_base + kext->data_off;
+                }
+
+                if (kext->kmod_addr) {
+                    kmod_info_64_v1_t* kext_kmod = (kmod_info_64_v1_t*)(kext->kmod_addr - new_prelink_data_base + (uint64_t)prelink_data_buf);
+                    printf("K add: 0x%llx\n", kext_kmod->address);
+                    printf("K n: %s\n", kext_kmod->name);
+                    kext_kmod->address = new_prelink_text_base + kext->text_off;
+                    segment_command_64_t* kext_text_exec_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__TEXT_EXEC");
+                    kext_kmod->start_addr -= kext_text_exec_seg->vmaddr;
+                    kext_kmod->start_addr += new_prelink_text_exec_base;
+                    kext_kmod->stop_addr -= kext_text_exec_seg->vmaddr;
+                    kext_kmod->stop_addr += new_prelink_text_exec_base;
+                }
+            }
+        }
+
+        // 创建 PRELINK_INFO
+        char* prelink_info_buf;
+        uint64_t prelink_info_size;
+        prelink_info_buf = make_prelink_info(y_kernel, prelink_info_size);
+        uint64_t new_prelink_info_fileoff = new_prelink_data_fileoff + prelink_data_size;
+        uint64_t new_kernel_size = new_prelink_info_fileoff + prelink_info_size;
+        uint64_t new_prelink_info_base = new_prelink_data_base + prelink_data_size;
+
+        // 修改内核基址
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_TEXT"), new_prelink_text_fileoff, new_prelink_text_base, prelink_text_size);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_TEXT_EXEC"), new_prelink_text_exec_fileoff, new_prelink_text_exec_base, prelink_text_exec_size);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_DATA"), new_prelink_data_fileoff, new_prelink_data_base, prelink_data_size);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_DATA_CONST"), new_prelink_data_const_fileoff, new_prelink_data_const_base, prelink_data_const_size);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_LLVM_COV"), new_prelink_info_fileoff, new_prelink_info_base, 0);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_LINKEDIT"), new_prelink_info_fileoff, new_prelink_info_base, 0);
+        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_INFO"), new_prelink_info_fileoff, new_prelink_info_base, prelink_info_size);
+
+
+        // 修改Kext段基址
         for (auto kext : y_kernel.kexts) {
             if (kext->exec_macho) {
                 if (kext->exec_macho->find_segment("__TEXT")) {
@@ -365,8 +446,10 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_exec_base + kext->text_exec_off, seg->filesize);
                             else if (!strncmp(seg->segname, "__DATA", 16))
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_base + kext->data_off, seg->filesize);
-                            else if (!strncmp(seg->segname, "__DATA", 16))
+                            else if (!strncmp(seg->segname, "__DATA_CONST", 16))
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_const_base + kext->data_const_off, seg->filesize);
+                            else if (!strncmp(seg->segname, "__LINKEDIT", 16))
+                                patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_info_base, 0);
                         } else if (lcd->cmd == LC_SEGMENT) {
                         }
                         lcd = (struct load_command*)((uint64_t)lcd + lcd->cmdsize);
@@ -375,23 +458,16 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
             }
         }
 
-        // 获取内核末尾
-        segment_command_64_t* linkedit_seg = (segment_command_64_t*)y_kernel.find_segment("__LINKEDIT");
-        uint64_t end_fileoff = linkedit_seg->fileoff + linkedit_seg->filesize;
-        end_fileoff = ALIGN_UP(end_fileoff, 1 << 13);
-        printf("End ad 0x%016llx\n", end_fileoff);
-        uint64_t new_prelink_text_fileoff = end_fileoff;
-        uint64_t new_prelink_text_exec_fileoff = new_prelink_text_fileoff + prelink_text_size;
-        uint64_t new_prelink_data_fileoff = new_prelink_text_exec_fileoff + prelink_text_exec_size;
-        uint64_t new_prelink_data_const_fileoff = new_prelink_data_fileoff + prelink_data_const_size;
-
-        // 修改内核基址
-        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_TEXT"), new_prelink_text_fileoff, new_prelink_text_base, prelink_text_size);
-        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_TEXT_EXEC"), new_prelink_text_exec_fileoff, new_prelink_text_exec_base, prelink_text_exec_size);
-        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PRELINK_DATA"), new_prelink_data_fileoff, new_prelink_data_base, prelink_data_size);
-        patch_seg_base((segment_command_64_t*)y_kernel.find_segment("__PLK_DATA_CONST"), new_prelink_data_const_fileoff, new_prelink_data_const_base, prelink_data_const_size);
-
-        make_prelink_info(y_kernel);
+        
+        // 最后将段复制到内核中
+        printf("New kernel filesize: 0x%x\n", new_kernel_size);
+        y_kernel.file_buf = (char*)realloc(y_kernel.file_buf, new_kernel_size);
+        y_kernel.file_size = new_kernel_size;
+        memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_text_fileoff), prelink_text_buf, prelink_text_size);
+        memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_text_exec_fileoff), prelink_text_exec_buf, prelink_text_exec_size);
+        memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_data_const_fileoff), prelink_data_const_buf, prelink_data_const_size);
+        memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_data_fileoff), prelink_data_buf, prelink_data_size);
+        memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_info_fileoff), prelink_info_buf, prelink_info_size);
     }
 }
 
@@ -468,6 +544,7 @@ void format_prelink_info(KernelMacho& kernel)
                     kext_macho->format_macho();
                     kext->exec_macho = kext_macho;
                     kext->exec_macho->file_size = plist_get_uint64(kextNode, "_PrelinkExecutableSize");
+                    kext->kmod_addr = plist_get_uint64(kextNode, "_PrelinkKmodInfo");
                 }
                 kext->kextInfoElement = kextNode;
                 kext->kext_id = plist_get_string(kextNode, "CFBundleIdentifier");
@@ -581,7 +658,7 @@ Kext* load_kext_from_file(const char* path)
     Kext* kext = new Kext();
     // Kext *kext = (Kext *)malloc(sizeof(Kext));
     KextMacho* kext_file = new KextMacho(kext_exec_path);
-    kext->from_file = true;
+    kext->is_from_file = true;
     kext->exec_macho = kext_file;
     kext_file->format_macho();
 
