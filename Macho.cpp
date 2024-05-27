@@ -16,17 +16,17 @@ void Macho::init_symbols()
     printf("Mach-o has %d symbols\n", symbol_count);
 
     for (int i = 0; i < symbol_count; i++) {
-            Symbol* sym = new Symbol();
-            sym->symbol_addr = sym_list[i].n_value;
-            sym->symbol_name = (const char*)((uint64_t)symstr + sym_list[i].n_un.n_strx);
-            
-            if(sym->symbol_addr) {
-                symbol_addr_map[sym->symbol_addr] = sym;
-            }
-            if(sym->symbol_name) {
-                symbol_name_map[sym->symbol_name] = sym;
-            }
-            symbol_list.push_back(sym);
+        Symbol* sym = new Symbol();
+        sym->symbol_addr = sym_list[i].n_value;
+        sym->symbol_name = (const char*)((uint64_t)symstr + sym_list[i].n_un.n_strx);
+
+        if (sym->symbol_addr) {
+            symbol_addr_map[sym->symbol_addr] = sym;
+        }
+        if (sym->symbol_name) {
+            symbol_name_map[sym->symbol_name] = sym;
+        }
+        symbol_list.push_back(sym);
     }
 }
 
@@ -83,6 +83,22 @@ load_command* Macho::find_command(uint32_t cmd)
         }
 
         lcd = (load_command*)((uint64_t)lcd + lcd->cmdsize);
+    }
+
+    return NULL;
+}
+
+void* Macho::find_section(const char* segname, const char* section_name)
+{
+    segment_command_64_t* seg = (segment_command_64_t*)find_segment(segname);
+    if (seg) {
+        section_64_t* sect = (section_64_t*)((uint64_t)seg + sizeof(segment_command_64_t));
+        for (int i = 0; i < seg->nsects; i++) {
+            if(!strncmp(sect->sectname, section_name, 16)) {
+                return sect;
+            }
+            sect = (section_64_t*)(sect + 1);
+        }
     }
 
     return NULL;

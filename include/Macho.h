@@ -266,6 +266,7 @@ public:
     void init_symbols();
     void copy_from_file(uint64_t offset, char *targetBuff, size_t size);
     void *find_segment(const char *segment_name);
+    void *find_section(const char *segname, const char *section_name);
 	load_command *find_command(uint32_t cmd);
 
 	Macho();
