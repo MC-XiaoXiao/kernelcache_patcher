@@ -172,12 +172,13 @@ void copy_segment_from_kext(Kext* kext, KernelMacho& i_kerenl, const char* kext_
             copy_src -= i_seg->vmaddr;
             copy_src += (uint64_t)i_kerenl.file_buf + i_seg->fileoff;
         }
-        copy_size = ALIGN_UP(text_exec_seg->vmsize, 1 << 5);
+        
         copy_des = (uint64_t)buf + off;
-
+        copy_size = text_exec_seg->filesize;
         // printf("Copy 0x%016llx -> 0x%016llx(0x%08x)\n", copy_src, off, copy_size);
-
+        memset((void *)copy_des, 0, copy_size);
         memcpy((char*)copy_des, (char*)copy_src, copy_size);
+        copy_size = ALIGN_UP(text_exec_seg->vmsize, 1 << 5);
         off += copy_size;
     }
 }
@@ -311,6 +312,11 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
         printf("pre data size: %x\n", prelink_data_size);
         printf("pre data const size: %x\n", prelink_data_const_size);
 
+        prelink_text_size = ALIGN_UP(prelink_text_size, 1 << 13);
+        prelink_text_exec_size = ALIGN_UP(prelink_text_exec_size, 1 << 13);
+        prelink_data_size = ALIGN_UP(prelink_data_size, 1 << 13);
+        prelink_data_const_size = ALIGN_UP(prelink_data_const_size, 1 << 13);
+
         void* prelink_text_buf = calloc(sizeof(char), prelink_text_size);
         void* prelink_text_exec_buf = calloc(sizeof(char), prelink_text_exec_size);
         void* prelink_data_buf = calloc(sizeof(char), prelink_data_size);
@@ -328,6 +334,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                 kext->text_off = kerenl_text_off;
                 segment_command_64_t* text_seg = (segment_command_64_t*)(kext->exec_macho->find_segment("__TEXT"));
                 if (text_seg && text_seg->filesize > 0) {
+                    memset((void *)((uint64_t)prelink_text_buf + kerenl_text_off), 0, text_seg->filesize);
                     memcpy((char*)((uint64_t)prelink_text_buf + kerenl_text_off),
                         (char*)(uint64_t)kext->exec_macho->file_buf + text_seg->fileoff,
                         text_seg->filesize);
@@ -351,11 +358,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                 copy_segment_from_kext(kext, i_kerenl, "__DATA_CONST", "__PLK_DATA_CONST", prelink_data_const_buf, kerenl_data_const_off);
             }
         }
-
-        prelink_text_size = ALIGN_UP(prelink_text_size, 1 << 13);
-        prelink_text_exec_size = ALIGN_UP(prelink_text_exec_size, 1 << 13);
-        prelink_data_size = ALIGN_UP(prelink_data_size, 1 << 13);
-        prelink_data_const_size = ALIGN_UP(prelink_data_const_size, 1 << 13);
 
         // 重新设定头部地址
         // 先计算各段基址
