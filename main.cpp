@@ -517,8 +517,10 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                     if (strstr(insn[i + 1].mnemonic, "ldr")) {
                                         int next_cmd_off_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
                                         off = insn[i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
-                                    } else if (strstr(insn[i + 1].mnemonic, "ldr")) {
+                                    } else if (strstr(insn[i + 1].mnemonic, "add")) {
                                         off = getSingleIMM(handle, &insn[i + 1]);
+                                    } else {
+                                        printf("Unprocessed instructions %s\n", insn[i + 1].mnemonic);
                                     }
 
                                     if (imm >= kext_text_seg->vmaddr && imm < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
@@ -536,15 +538,14 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                         patch_addr += new_prelink_data_const_base + kext->data_const_off;
                                     }
                                     off = patch_addr & 0xFFF;
-                                        // printf("%llx\n", patch_addr);
                                     patch_addr &= ~0xFFF;
 
-                                    char new_cmd[15];
-                                    sprintf(new_cmd, "adrp %s, 0x%llx", write_reg, patch_addr);
-                                    uint64_t cmd_addr = insn[i].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
-                                    ks_asm(ks, new_cmd, cmd_addr, &encode, &encode_size, &stat_count);
+                                    char new_insn[15];
+                                    sprintf(new_insn, "adrp %s, 0x%llx", write_reg, patch_addr);
+                                    uint64_t insn_addr = insn[i].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
+                                    ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count);
                                     for (size_t j = 0; j < encode_size; j++) {
-                                        ((unsigned char*)((uint64_t)prelink_text_exec_buf + cmd_addr - new_prelink_text_exec_base))[j] = encode[j];
+                                        ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
                                     }
 
                                     if (strstr(insn[i + 1].mnemonic, "ldr")) {
@@ -553,7 +554,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                         int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
                                         const char *reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
                                         // printf("%s %s\n", reg1_name, reg2_name);
-                                        sprintf(new_cmd, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
+                                        sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
                                         // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
                                     } else if(strstr(insn[i + 1].mnemonic, "add")) {
                                         int rcount = cs_op_count(handle, &insn[i + 1], ARM64_OP_REG);
@@ -568,13 +569,15 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                             // 
                                         }
                                         // printf("%s %s\n", reg1_name , reg2_name);
-                                        sprintf(new_cmd, "add %s, %s, #0x%lld", reg1_name, reg2_name, off);
+                                        sprintf(new_insn, "add %s, %s, #0x%llx", reg1_name, reg2_name, off);
                                     }
 
-                                    cmd_addr = insn[i + 1].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
-                                    ks_asm(ks, new_cmd, cmd_addr, &encode, &encode_size, &stat_count);
+                                    insn_addr = insn[i + 1].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
+                                    if(ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
+                                        exit(-1);
+                                    }
                                     for (size_t j = 0; j < encode_size; j++) {
-                                        ((unsigned char*)((uint64_t)prelink_text_exec_buf + cmd_addr - new_prelink_text_exec_base))[j] = 0;
+                                        ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
                                     }
                                 }
                             }
