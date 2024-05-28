@@ -7,6 +7,8 @@
 #include <KernelMacho.h>
 #include <KextMacho.h>
 #include <Macho.h>
+#include <capstone/capstone.h>
+#include <keystone/keystone.h>
 #include <tinyxml2.h>
 
 #define PATH_LENGTH 255
@@ -298,6 +300,25 @@ char* make_prelink_info(KernelMacho& kernel, uint64_t& info_size)
     return result;
 }
 
+// 得到单条指令的立即数
+#pragma mark imp:得到单条指令的立即数
+uint64_t getSingleIMM(csh handle, const cs_insn* insn)
+{
+    int i;
+    uint64_t imm;
+    int acount = cs_op_count(handle, insn, ARM64_OP_IMM);
+    if (acount) {
+        if (acount > 1)
+            printf("getSingleIMM Immediate number more than one\n");
+        for (i = 1; i < acount + 1; /*i++*/) {
+            int index = cs_op_index(handle, insn, ARM64_OP_IMM, i);
+            imm = insn->detail->arm64.operands[index].imm;
+            return imm;
+        }
+    }
+    return 0;
+}
+
 void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
 {
     if (y_kernel.is_newer_ver) {
@@ -392,11 +413,26 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
         uint64_t new_prelink_data_fileoff = new_prelink_data_const_fileoff + prelink_data_const_size;
 
         // 修改Kext符号表
+        csh handle;
+        if (cs_open(CS_ARCH_ARM64, (cs_mode)(CS_MODE_ARM | CS_MODE_LITTLE_ENDIAN), &handle)) {
+            printf("ERROR: Failed to initialize engine!\n");
+            return;
+        }
+        cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+        cs_insn* insn;
+
+        ks_engine* ks;
+        if (ks_open(KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN, &ks)) {
+            printf("ERROR: failed on ks_open(), quit\n");
+            return;
+        }
+
         for (auto kext : y_kernel.kexts) {
             // KMOD处理
             if (kext->exec_macho) {
+                segment_command_64_t* kext_text_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__TEXT");
                 segment_command_64_t* kext_data_const_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__DATA_CONST");
-                segment_command_64_t* kext_text_exec_const_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__TEXT_EXEC");
+                segment_command_64_t* kext_text_exec_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__TEXT_EXEC");
                 segment_command_64_t* kext_data_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__DATA");
 
                 if (kext->is_from_file) {
@@ -432,19 +468,77 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                 section_64_t* init_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_init_func");
                 section_64_t* term_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_term_func");
 
-                if (kext_data_const_seg && init_sect && init_sect && kext_data_const_seg) {
-                    uint64_t* mod_addr = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + init_sect->addr - kext_data_const_seg->vmaddr);
-                    for (size_t i = 0; i < init_sect->size / sizeof(uint64_t); i++) {
-                        *mod_addr = *mod_addr - kext_text_exec_const_seg->vmaddr;
-                        *mod_addr = *mod_addr + kext->text_exec_off + new_prelink_text_exec_base;
-                        mod_addr++;
-                    }
+                if (kext_data_const_seg) {
+                    if (init_sect && init_sect && kext_text_exec_seg) {
+                        uint64_t* mod_addr = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + init_sect->addr - kext_data_const_seg->vmaddr);
+                        for (size_t i = 0; i < init_sect->size / sizeof(uint64_t); i++) {
+                            *mod_addr = *mod_addr - kext_text_exec_seg->vmaddr;
+                            *mod_addr = *mod_addr + kext->text_exec_off + new_prelink_text_exec_base;
 
-                    mod_addr = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + term_sect->addr - kext_data_const_seg->vmaddr);
-                    for (size_t i = 0; i < init_sect->size / sizeof(uint64_t); i++) {
-                        *mod_addr = *mod_addr - kext_text_exec_const_seg->vmaddr;
-                        *mod_addr = *mod_addr + kext->text_exec_off + new_prelink_text_exec_base;
-                        mod_addr++;
+                            mod_addr++;
+                        }
+
+                        mod_addr = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + term_sect->addr - kext_data_const_seg->vmaddr);
+                        for (size_t i = 0; i < init_sect->size / sizeof(uint64_t); i++) {
+                            *mod_addr = *mod_addr - kext_text_exec_seg->vmaddr;
+                            *mod_addr = *mod_addr + kext->text_exec_off + new_prelink_text_exec_base;
+
+                            mod_addr++;
+                        }
+                    }
+                }
+
+                // 修补adrp
+                if (kext_text_exec_seg) {
+                    size_t count;
+                    cs_insn* insn;
+                    uint64_t kext_text_exec_buf_addr = (uint64_t)prelink_text_exec_buf + kext->text_exec_off;
+
+                    count = cs_disasm(handle, (const uint8_t*)kext_text_exec_buf_addr, kext_text_exec_seg->filesize, kext_text_exec_seg->vmaddr, 0, &insn);
+
+                    if (count > 0) {
+                        for (size_t i = 0; i < count; i++) {
+                            if (strstr(insn[i].mnemonic, "adrp")) {
+                                int acount = cs_op_count(handle, &insn[i], ARM64_OP_IMM);
+                                // printf("acount: %d\n", acount);
+                                if (acount == 1) {
+                                    uint64_t* xx = NULL;
+                                    uint64_t imm = getSingleIMM(handle, &insn[i]);
+
+                                    unsigned char* encode;
+                                    size_t encode_size;
+                                    size_t stat_count;
+                                    int index = cs_op_index(handle, &insn[i], ARM64_OP_REG, 1);
+                                    const char *write_reg = cs_reg_name(handle, insn[i].detail->arm64.operands[index].reg);
+                                    uint64_t patch_addr = 0;
+
+                                    if (imm >= kext_text_seg->vmaddr && imm < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
+                                        patch_addr = imm - kext_text_seg->vmaddr;
+                                        patch_addr += new_prelink_text_base;
+                                    } else if (imm >= kext_text_exec_seg->vmaddr && imm < kext_text_exec_seg->vmaddr + kext_text_exec_seg->vmsize) {
+                                        patch_addr = imm - kext_text_exec_seg->vmaddr;
+                                        patch_addr += new_prelink_text_exec_base;
+                                    } else if (imm >= kext_data_seg->vmaddr && imm < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
+                                        patch_addr = imm - kext_data_seg->vmaddr;
+                                        patch_addr += new_prelink_data_base;
+                                        
+                                    } else if (imm >= kext_data_const_seg->vmaddr && imm < (kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize)) {
+                                        patch_addr = imm - kext_data_const_seg->vmaddr;
+                                        patch_addr += new_prelink_data_const_base;
+                                    }
+                                    char new_cmd[15];
+                                    sprintf(new_cmd, "adrp %s, 0x%llx", write_reg, patch_addr);
+                                    uint64_t cmd_addr = insn[i].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
+                                    ks_asm(ks, new_cmd, cmd_addr, &encode, &encode_size, &stat_count);
+                                    for (size_t j = 0; j < encode_size; j++)
+                                    {
+                                        ((unsigned char *)((uint64_t)prelink_text_exec_buf + cmd_addr - new_prelink_text_exec_base))[j] = encode[j];
+                                    }
+
+                                    
+                                }
+                            }
+                        }
                     }
                 }
             }
