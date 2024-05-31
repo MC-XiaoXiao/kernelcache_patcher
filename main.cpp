@@ -13,7 +13,8 @@
 
 #define PATH_LENGTH 255
 
-#define ALIGN_UP(x, y) (((x) + (y)) & ~((y) - 1))
+#define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
+#define SEG_ALIGN 1 << 6
 
 using namespace tinyxml2;
 
@@ -129,10 +130,10 @@ uint32_t get_prelink_text_size(KernelMacho& kernel)
         if (kext->exec_macho) {
             segment_command_64_t* text_seg = (segment_command_64_t*)(kext->exec_macho->find_segment("__TEXT"));
             if (text_seg) {
-                size += ALIGN_UP(text_seg->vmsize, 1 << 5);
+                size += ALIGN_UP(text_seg->vmsize, SEG_ALIGN);
             } else if (kext->exec_macho->header) {
                 if (kext->exec_macho->header->sizeofcmds) {
-                    size += ALIGN_UP(kext->exec_macho->header->sizeofcmds, 1 << 5);
+                    size += ALIGN_UP(kext->exec_macho->header->sizeofcmds, SEG_ALIGN);
                 }
             }
         }
@@ -149,7 +150,7 @@ uint32_t get_prelink_segment_size(KernelMacho& kernel, const char* seg_name)
         if (kext->exec_macho) {
             segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment(seg_name));
             if (text_exec_seg) {
-                size += ALIGN_UP(text_exec_seg->vmsize, 1 << 5);
+                size += ALIGN_UP(text_exec_seg->vmsize, SEG_ALIGN);
             }
         }
     }
@@ -180,7 +181,7 @@ void copy_segment_from_kext(Kext* kext, KernelMacho& i_kerenl, const char* kext_
         // printf("Copy 0x%016llx -> 0x%016llx(0x%08x)\n", copy_src, off, copy_size);
         memset((void*)copy_des, 0, copy_size);
         memcpy((char*)copy_des, (char*)copy_src, copy_size);
-        copy_size = ALIGN_UP(text_exec_seg->vmsize, 1 << 5);
+        copy_size = ALIGN_UP(text_exec_seg->vmsize, SEG_ALIGN);
         off += copy_size;
     }
 }
@@ -291,7 +292,7 @@ char* make_prelink_info(KernelMacho& kernel, uint64_t& info_size)
 
     // printf("%s", streamer.CStr());
     info_size = streamer.CStrSize();
-    info_size = ALIGN_UP(info_size, 1 << 13);
+    info_size = ALIGN_UP(info_size, 1 << 12);
     printf("Preinfo size: %x\n", info_size);
     result = (char*)malloc(info_size);
     const char* tmp = streamer.CStr();
@@ -332,10 +333,10 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
         printf("pre data size: %x\n", prelink_data_size);
         printf("pre data const size: %x\n", prelink_data_const_size);
 
-        prelink_text_size = ALIGN_UP(prelink_text_size, 1 << 13);
-        prelink_text_exec_size = ALIGN_UP(prelink_text_exec_size, 1 << 13);
-        prelink_data_size = ALIGN_UP(prelink_data_size, 1 << 13);
-        prelink_data_const_size = ALIGN_UP(prelink_data_const_size, 1 << 13);
+        prelink_text_size = ALIGN_UP(prelink_text_size, 1 << 12);
+        prelink_text_exec_size = ALIGN_UP(prelink_text_exec_size, 1 << 12);
+        prelink_data_size = ALIGN_UP(prelink_data_size, 1 << 12);
+        prelink_data_const_size = ALIGN_UP(prelink_data_const_size, 1 << 12);
 
         void* prelink_text_buf = calloc(sizeof(char), prelink_text_size);
         void* prelink_text_exec_buf = calloc(sizeof(char), prelink_text_exec_size);
@@ -359,10 +360,10 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                         (char*)(uint64_t)kext->exec_macho->file_buf + text_seg->fileoff,
                         text_seg->filesize);
                     // printf("Copy 0x%016llx -> 0x%016llx\n", text_seg->fileoff, kerenl_text_off);
-                    kerenl_text_off += ALIGN_UP(text_seg->filesize, 1 << 5);
+                    kerenl_text_off += ALIGN_UP(text_seg->filesize, SEG_ALIGN);
                 } else {
                     if (kext->exec_macho->header->sizeofcmds) {
-                        size = ALIGN_UP(kext->exec_macho->header->sizeofcmds, 1 << 5);
+                        size = ALIGN_UP(kext->exec_macho->header->sizeofcmds, SEG_ALIGN);
                         memcpy((char*)((uint64_t)prelink_text_buf + kerenl_text_off),
                             (char*)(uint64_t)kext->exec_macho->file_buf,
                             size);
@@ -394,7 +395,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
 
         uint64_t kernel_text_vmbase = y_text_segment->vmaddr;
         new_prelink_data_const_base = kernel_text_vmbase - prelink_data_const_size;
-        new_prelink_data_base = ALIGN_UP(y_linkedit_seg->vmaddr + y_linkedit_seg->vmsize, 1 << 13);
+        new_prelink_data_base = ALIGN_UP(y_linkedit_seg->vmaddr + y_linkedit_seg->vmsize, 1 << 12);
         new_prelink_text_exec_base = new_prelink_data_const_base - prelink_text_exec_size;
         new_prelink_text_base = new_prelink_text_exec_base - prelink_text_size;
 
@@ -404,7 +405,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
 
         // 获取内核末尾
         uint64_t end_fileoff = y_linkedit_seg->fileoff + y_linkedit_seg->filesize;
-        end_fileoff = ALIGN_UP(end_fileoff, 1 << 13);
+        end_fileoff = ALIGN_UP(end_fileoff, 1 << 12);
         printf("End ad 0x%016llx\n", end_fileoff);
         uint64_t new_prelink_text_fileoff = end_fileoff;
         uint64_t new_prelink_text_exec_fileoff = new_prelink_text_fileoff + prelink_text_size;
@@ -419,6 +420,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
             return;
         }
         cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+        cs_option(handle, CS_OPT_SKIPDATA, CS_OPT_ON);
         cs_insn* insn;
 
         ks_engine* ks;
@@ -465,10 +467,10 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
 
                 // 修复data const段的地址
                 // 修复mod_init_func和mod_term_func
-                section_64_t* init_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_init_func");
-                section_64_t* term_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_term_func");
 
                 if (kext_data_const_seg) {
+                    section_64_t* init_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_init_func");
+                    section_64_t* term_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_term_func");
                     if (init_sect && init_sect && kext_text_exec_seg) {
                         uint64_t* mod_addr = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + init_sect->addr - kext_data_const_seg->vmaddr);
                         for (size_t i = 0; i < init_sect->size / sizeof(uint64_t); i++) {
@@ -486,6 +488,46 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                             mod_addr++;
                         }
                     }
+
+                    section_64_t* kalloc_type_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__kalloc_type");
+                    if (kalloc_type_sect) {
+                        kalloc_type_view_t kalloc_types = (kalloc_type_view_t)((uint64_t)prelink_data_const_buf + kext->data_const_off + kalloc_type_sect->addr - kext_data_const_seg->vmaddr);
+                        for (size_t i = 0; i < kalloc_type_sect->size / sizeof(struct kalloc_type_view); i++) {
+                            if (kalloc_types[i].kt_zv.zv_name) {
+                                kalloc_types[i].kt_zv.zv_name -= kext_text_seg->vmaddr;
+                                kalloc_types[i].kt_zv.zv_name += kext->text_off + new_prelink_text_base;
+                            }
+
+                            if (kalloc_types[i].kt_signature) {
+                                kalloc_types[i].kt_signature -= kext_text_seg->vmaddr;
+                                kalloc_types[i].kt_signature += kext->text_off + new_prelink_text_base;
+                            }
+                        }
+                    }
+
+                    section_64_t* kalloc_type_var_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__kalloc_var");
+                    if(kalloc_type_var_sect) {
+                        kalloc_type_var_view_t kalloc_type_vars = (kalloc_type_var_view_t)((uint64_t)prelink_data_const_buf + kext->data_const_off + kalloc_type_var_sect->addr - kext_data_const_seg->vmaddr);
+                        for (size_t i = 0; i < kalloc_type_var_sect->size / sizeof(struct kalloc_type_var_view); i++)
+                        {
+                            if(kalloc_type_vars[i].kt_name) {
+                                printf("%llx\n", kalloc_type_vars[i].kt_name);
+                                kalloc_type_vars[i].kt_name -= kext_text_seg->vmaddr;
+                                kalloc_type_vars[i].kt_name += kext->text_off + new_prelink_text_base;
+                            }
+
+                            if(kalloc_type_vars[i].kt_sig_hdr) {
+                                kalloc_type_vars[i].kt_sig_hdr -= kext_text_seg->vmaddr;
+                                kalloc_type_vars[i].kt_sig_hdr += kext->text_off + new_prelink_text_base;
+                            }
+
+                            if(kalloc_type_vars[i].kt_sig_type) {
+                                kalloc_type_vars[i].kt_sig_type -= kext_text_seg->vmaddr;
+                                kalloc_type_vars[i].kt_sig_type += kext->text_off + new_prelink_text_base;
+                            }
+                        }
+                        
+                    }
                 }
 
                 // 修补adrp
@@ -495,7 +537,8 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                     uint64_t kext_text_exec_buf_addr = (uint64_t)prelink_text_exec_buf + kext->text_exec_off;
 
                     count = cs_disasm(handle, (const uint8_t*)kext_text_exec_buf_addr, kext_text_exec_seg->filesize, kext_text_exec_seg->vmaddr, 0, &insn);
-
+                    printf("Count: %x\n");
+                    printf("Nedd: %x\n", kext_text_exec_seg->filesize / 4);
                     if (count > 0) {
                         for (size_t i = 0; i < count; i++) {
                             if (strstr(insn[i].mnemonic, "adrp")) {
@@ -519,8 +562,21 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                         off = insn[i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
                                     } else if (strstr(insn[i + 1].mnemonic, "add")) {
                                         off = getSingleIMM(handle, &insn[i + 1]);
+                                    } else if (strstr(insn[i + 1].mnemonic, "str")) {
+                                        int next_cmd_off_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
+                                        off = insn[i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
                                     } else {
-                                        printf("Unprocessed instructions %s\n", insn[i + 1].mnemonic);
+                                        printf("Unprocessed instructions %s at %llx\n", insn[i + 1].mnemonic, insn[i + 1].address);
+                                        for (size_t j = 0; j < 20; j++) {
+                                            // printf("%llx\n", insn[i + j + 1].address);
+                                            printf("%x %x\n", insn[j].detail->regs_read_count, insn[j + i + 1].detail->arm64.operands[1].reg);
+                                            if (insn[j + i + 1].detail->arm64.operands[1].reg == insn[i].detail->arm64.operands[reg_index].reg) {
+                                                printf("!Found\n");
+                                                break;
+                                            }
+                                        }
+
+                                        continue;
                                     }
 
                                     if (imm >= kext_text_seg->vmaddr && imm < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
@@ -538,11 +594,14 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                         patch_addr += new_prelink_data_const_base + kext->data_const_off;
                                     }
                                     off = patch_addr & 0xFFF;
+                                    // printf("Addr: %llx\n", patch_addr);
+                                    // printf("off: %llx\n", off);
                                     patch_addr &= ~0xFFF;
 
                                     char new_insn[15];
                                     sprintf(new_insn, "adrp %s, 0x%llx", write_reg, patch_addr);
                                     uint64_t insn_addr = insn[i].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
+                                    // printf("%llx\n", insn_addr);
                                     ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count);
                                     for (size_t j = 0; j < encode_size; j++) {
                                         ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
@@ -550,30 +609,36 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
 
                                     if (strstr(insn[i + 1].mnemonic, "ldr")) {
                                         int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
-                                        const char *reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
+                                        const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
                                         int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                        const char *reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
+                                        const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
                                         // printf("%s %s\n", reg1_name, reg2_name);
                                         sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
                                         // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                    } else if(strstr(insn[i + 1].mnemonic, "add")) {
+                                    } else if (strstr(insn[i + 1].mnemonic, "add")) {
                                         int rcount = cs_op_count(handle, &insn[i + 1], ARM64_OP_REG);
-                                        const char *reg1_name;
-                                        const char *reg2_name;
-                                        if(rcount == 2) {
+                                        const char* reg1_name;
+                                        const char* reg2_name;
+                                        if (rcount == 2) {
                                             int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
                                             int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 2);
                                             reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
                                             reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].reg);
                                         } else {
-                                            // 
+                                            //
                                         }
                                         // printf("%s %s\n", reg1_name , reg2_name);
                                         sprintf(new_insn, "add %s, %s, #0x%llx", reg1_name, reg2_name, off);
+                                    } else if (strstr(insn[i + 1].mnemonic, "str")) {
+                                        int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
+                                        const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
+                                        int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
+                                        const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
+                                        sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
                                     }
 
                                     insn_addr = insn[i + 1].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
-                                    if(ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
+                                    if (ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
                                         exit(-1);
                                     }
                                     for (size_t j = 0; j < encode_size; j++) {
@@ -616,16 +681,19 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                             segment_command_64_t* seg = (segment_command_64_t*)lcd;
                             if (!strncmp(seg->segname, "__TEXT", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_base + kext->text_off, seg->filesize);
+                                printf("Kext __TEXT at 0x%llx\n", new_prelink_text_base + kext->text_off, seg->filesize);
                             } else if (!strncmp(seg->segname, "__TEXT_EXEC", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_exec_base + kext->text_exec_off, seg->vmsize);
-
+                                printf("Kext __TEXT_EXEC at 0x%llx\n", new_prelink_text_exec_base + kext->text_exec_off);
                                 patch_seg_fileoff((segment_command_64_t*)lcd, (new_prelink_text_exec_fileoff + kext->text_exec_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
-                                printf("%p -- %p\n", (kerenl_text_exec_off + kext->text_exec_off), (new_prelink_text_fileoff + kext->text_off));
+                                // printf("%p -- %p\n", (kerenl_text_exec_off + kext->text_exec_off), (new_prelink_text_fileoff + kext->text_off));
                             } else if (!strncmp(seg->segname, "__DATA", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_base + kext->data_off, seg->filesize);
+                                printf("Kext __DATA at 0x%llx\n", new_prelink_data_base + kext->data_off);
                                 patch_seg_fileoff((segment_command_64_t*)lcd, (new_prelink_data_fileoff + kext->data_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
                             } else if (!strncmp(seg->segname, "__DATA_CONST", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_const_base + kext->data_const_off, seg->filesize);
+                                printf("Kext __DATA_CONST at 0x%llx\n", new_prelink_data_const_base + kext->data_const_off);
                                 patch_seg_fileoff((segment_command_64_t*)lcd, (new_prelink_data_const_fileoff + kext->data_const_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
                             } else if (!strncmp(seg->segname, "__LINKEDIT", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_info_base, 0);

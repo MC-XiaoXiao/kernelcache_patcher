@@ -239,6 +239,59 @@ struct nlist_64
     uint64_t n_value; /* value of this symbol (or stab offset) */
 };
 
+
+typedef struct zone_view *zone_view_t;
+struct zone_view {
+	uint64_t          zv_zone;
+	uint64_t    	zv_stats;
+	const char     *zv_name;
+	zone_view_t     zv_next;
+};
+
+struct kalloc_type_view {
+	struct zone_view        kt_zv;
+	const char             *kt_signature;
+	uint32_t     kt_flags;
+	uint32_t                kt_size;
+	void                   *unused1;
+	void                   *unused2;
+};
+
+typedef struct kalloc_type_view *kalloc_type_view_t;
+
+#define kalloc_log2down(mask)   (31 - __builtin_clz(mask))
+#define KHEAP_START_SIZE        32
+#define KHEAP_MAX_SIZE          (32 * 1024)
+#define KHEAP_EXTRA_ZONES       2
+#define KHEAP_STEP_WIDTH        2
+#define KHEAP_STEP_START        16
+#define KHEAP_START_IDX         kalloc_log2down(KHEAP_START_SIZE)
+#define KHEAP_NUM_STEPS         (kalloc_log2down(KHEAP_MAX_SIZE) - \
+	                                kalloc_log2down(KHEAP_START_SIZE))
+#define KHEAP_NUM_ZONES         (KHEAP_NUM_STEPS * KHEAP_STEP_WIDTH + \
+	                                KHEAP_EXTRA_ZONES)
+
+struct kalloc_type_var_view {
+	uint16_t   kt_version;
+	uint16_t                kt_size_hdr;
+	/*
+	 * Temporary: Needs to be 32bits cause we have many structs that use
+	 * IONew/Delete that are larger than 32K.
+	 */
+	uint32_t                kt_size_type;
+	uint64_t            	kt_stats;
+	const char             * kt_name;
+	zone_view_t             kt_next;
+	uint16_t               	kt_heap_start;
+	uint8_t                 kt_zones[KHEAP_NUM_ZONES];
+	const char             *  kt_sig_hdr;
+	const char             *  kt_sig_type;
+	uint32_t     			kt_flags;
+};
+
+typedef struct kalloc_type_var_view *kalloc_type_var_view_t;
+
+
 typedef struct Symbol {
 	const char *symbol_name;
 	uint64_t	symbol_addr;
