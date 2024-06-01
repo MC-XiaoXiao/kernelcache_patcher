@@ -459,10 +459,39 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                     printf("K n: %s\n", kext_kmod->name);
                     kext_kmod->address = new_prelink_text_base + kext->text_off;
                     segment_command_64_t* kext_text_exec_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__TEXT_EXEC");
-                    kext_kmod->start_addr -= kext_text_exec_seg->vmaddr;
-                    kext_kmod->start_addr += new_prelink_text_exec_base;
-                    kext_kmod->stop_addr -= kext_text_exec_seg->vmaddr;
-                    kext_kmod->stop_addr += new_prelink_text_exec_base;
+                    if (kext_kmod->start_addr) {
+                        kext_kmod->start_addr -= kext_text_exec_seg->vmaddr;
+                        kext_kmod->start_addr += new_prelink_text_exec_base + kext->text_exec_off;
+                    }
+                    if (kext_kmod->stop_addr) {
+                        kext_kmod->stop_addr -= kext_text_exec_seg->vmaddr;
+                        kext_kmod->stop_addr += new_prelink_text_exec_base + kext->text_exec_off;
+                    }
+                }
+
+                // 处理DATA段的地址
+                if (kext_data_seg) {
+                    section_64_t* kext_cstring_sect = (section_64*)kext->exec_macho->find_section("__TEXT", "__cstring");
+                    uint64_t* addrs = (uint64_t*)((uint64_t)prelink_data_buf + kext->data_off);
+                    for (size_t i = 0; i < kext_data_seg->vmsize / sizeof(uint64_t); i++) {
+                        if (addrs[i] >= kext_cstring_sect->addr && addrs[i] < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
+                            // printf("Data in __TEXT, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_text_seg->vmaddr;
+                            addrs[i] += new_prelink_text_base + kext->text_off;
+                        } else if (addrs[i] >= kext_text_exec_seg->vmaddr && addrs[i] < kext_text_exec_seg->vmaddr + kext_text_exec_seg->vmsize) {
+                            // printf("Data in __TEXT_EXEC, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_text_exec_seg->vmaddr;
+                            addrs[i] += new_prelink_text_exec_base + kext->text_exec_off;
+                        } else if (addrs[i] >= kext_data_seg->vmaddr && addrs[i] < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
+                            // printf("Data in __DATA, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_data_seg->vmaddr;
+                            addrs[i] += new_prelink_data_base + kext->data_off;
+                        } else if (addrs[i] >= kext_data_const_seg->vmaddr && addrs[i] < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
+                            // printf("Data in __DATA_CONST, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_data_const_seg->vmaddr;
+                            addrs[i] += new_prelink_data_const_base + kext->data_const_off;
+                        }
+                    }
                 }
 
                 // 修复data const段的地址
@@ -506,27 +535,25 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                     }
 
                     section_64_t* kalloc_type_var_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__kalloc_var");
-                    if(kalloc_type_var_sect) {
+                    if (kalloc_type_var_sect) {
                         kalloc_type_var_view_t kalloc_type_vars = (kalloc_type_var_view_t)((uint64_t)prelink_data_const_buf + kext->data_const_off + kalloc_type_var_sect->addr - kext_data_const_seg->vmaddr);
-                        for (size_t i = 0; i < kalloc_type_var_sect->size / sizeof(struct kalloc_type_var_view); i++)
-                        {
-                            if(kalloc_type_vars[i].kt_name) {
+                        for (size_t i = 0; i < kalloc_type_var_sect->size / sizeof(struct kalloc_type_var_view); i++) {
+                            if (kalloc_type_vars[i].kt_name) {
                                 printf("%llx\n", kalloc_type_vars[i].kt_name);
                                 kalloc_type_vars[i].kt_name -= kext_text_seg->vmaddr;
                                 kalloc_type_vars[i].kt_name += kext->text_off + new_prelink_text_base;
                             }
 
-                            if(kalloc_type_vars[i].kt_sig_hdr) {
+                            if (kalloc_type_vars[i].kt_sig_hdr) {
                                 kalloc_type_vars[i].kt_sig_hdr -= kext_text_seg->vmaddr;
                                 kalloc_type_vars[i].kt_sig_hdr += kext->text_off + new_prelink_text_base;
                             }
 
-                            if(kalloc_type_vars[i].kt_sig_type) {
+                            if (kalloc_type_vars[i].kt_sig_type) {
                                 kalloc_type_vars[i].kt_sig_type -= kext_text_seg->vmaddr;
                                 kalloc_type_vars[i].kt_sig_type += kext->text_off + new_prelink_text_base;
                             }
                         }
-                        
                     }
                 }
 
@@ -569,7 +596,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                         printf("Unprocessed instructions %s at %llx\n", insn[i + 1].mnemonic, insn[i + 1].address);
                                         for (size_t j = 0; j < 20; j++) {
                                             // printf("%llx\n", insn[i + j + 1].address);
-                                            printf("%x %x\n", insn[j].detail->regs_read_count, insn[j + i + 1].detail->arm64.operands[1].reg);
+                                            // printf("%x %x\n", insn[j].detail->regs_read_count, insn[j + i + 1].detail->arm64.operands[1].reg);
                                             if (insn[j + i + 1].detail->arm64.operands[1].reg == insn[i].detail->arm64.operands[reg_index].reg) {
                                                 printf("!Found\n");
                                                 break;
@@ -648,6 +675,22 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                             }
                         }
                     }
+                }
+
+                // 清空symtab
+                struct symtab_command* kext_symtab = (struct symtab_command*)find_command((mach_header_64_t*)((uint64_t)prelink_text_buf + kext->text_off), LC_SYMTAB);
+                struct dysymtab_command* kext_dysymtab = (struct dysymtab_command*)find_command((mach_header_64_t*)((uint64_t)prelink_text_buf + kext->text_off), LC_DYSYMTAB);
+                if (kext_symtab) {
+                    printf("Found kext symtab\n");
+                    kext_symtab->nsyms = 0;
+                    kext_symtab->stroff = 0;
+                    kext_symtab->strsize = 0;
+                    kext_symtab->symoff = 0;
+                }
+
+                if (kext_dysymtab) {
+                    printf("Found kext dysymtab\n");
+                    memset((void*)((uint64_t)kext_dysymtab + 8), 0, sizeof(struct dysymtab_command) - 8);
                 }
             }
         }

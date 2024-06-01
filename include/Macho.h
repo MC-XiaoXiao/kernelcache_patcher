@@ -291,6 +291,7 @@ struct kalloc_type_var_view {
 
 typedef struct kalloc_type_var_view *kalloc_type_var_view_t;
 
+load_command* find_command(mach_header_64_t* header, uint32_t cmd);
 
 typedef struct Symbol {
 	const char *symbol_name;

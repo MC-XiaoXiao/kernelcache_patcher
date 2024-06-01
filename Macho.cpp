@@ -68,6 +68,26 @@ uint32_t Macho::get_file_size()
     return result;
 }
 
+load_command* find_command(mach_header_64_t* header, uint32_t cmd)
+{
+    load_command* lcd = NULL;
+    if (header->magic == MH_MAGIC_64) {
+        lcd = (load_command*)(header + 1);
+    } else {
+        lcd = (load_command*)((mach_header_t*)header + 1);
+    }
+
+    for (int i = 0; i < header->ncmds; i++) {
+        if (lcd->cmd == cmd) {
+            return lcd;
+        }
+
+        lcd = (load_command*)((uint64_t)lcd + lcd->cmdsize);
+    }
+
+    return NULL;
+}
+
 load_command* Macho::find_command(uint32_t cmd)
 {
     load_command* lcd = NULL;
@@ -94,7 +114,7 @@ void* Macho::find_section(const char* segname, const char* section_name)
     if (seg) {
         section_64_t* sect = (section_64_t*)((uint64_t)seg + sizeof(segment_command_64_t));
         for (int i = 0; i < seg->nsects; i++) {
-            if(!strncmp(sect->sectname, section_name, 16)) {
+            if (!strncmp(sect->sectname, section_name, 16)) {
                 return sect;
             }
             sect = (section_64_t*)(sect + 1);
