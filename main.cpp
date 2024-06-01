@@ -439,7 +439,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
 
                 if (kext->is_from_file) {
                     if (kext->exec_macho->find_segment("__TEXT")) {
-                        // printf(">>>>>>>>>>>>>>>>>%d\n", kext->exec_macho->symbol_name_map.find("_kmod_info") == kext->exec_macho->symbol_name_map.end());
                         if (kext->exec_macho->symbol_name_map["_kmod_info"]) {
                             kext->kmod_addr = kext->exec_macho->symbol_name_map["_kmod_info"]->symbol_addr - kext_data_seg->vmaddr;
                             kext->kmod_addr += new_prelink_data_base + kext->data_off;
@@ -449,7 +448,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                         kext->kmod_addr = 0;
                     }
                 } else {
-                    // segment_command_64_t* kext_data_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__DATA");
                     kext->kmod_addr = kext->kmod_addr - kext_data_seg->vmaddr + new_prelink_data_base + kext->data_off;
                 }
 
@@ -515,6 +513,29 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                             *mod_addr = *mod_addr + kext->text_exec_off + new_prelink_text_exec_base;
 
                             mod_addr++;
+                        }
+                    }
+
+                    section_64_t* kext_cstring_sect = (section_64*)kext->exec_macho->find_section("__TEXT", "__cstring");
+                    section_64_t* kext_const_sect = (section_64*)kext->exec_macho->find_section("__DATA_CONST", "__const");
+                    uint64_t* addrs = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + kext_const_sect->addr - kext_data_const_seg->vmaddr);
+                    for (size_t i = 0; i < kext_const_sect->size / sizeof(uint64_t); i++) {
+                        if (addrs[i] >= kext_cstring_sect->addr && addrs[i] < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
+                            // printf("Data in __TEXT, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_text_seg->vmaddr;
+                            addrs[i] += new_prelink_text_base + kext->text_off;
+                        } else if (addrs[i] >= kext_text_exec_seg->vmaddr && addrs[i] < kext_text_exec_seg->vmaddr + kext_text_exec_seg->vmsize) {
+                            // printf("Data in __TEXT_EXEC, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_text_exec_seg->vmaddr;
+                            addrs[i] += new_prelink_text_exec_base + kext->text_exec_off;
+                        } else if (addrs[i] >= kext_data_seg->vmaddr && addrs[i] < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
+                            // printf("Data in __DATA, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_data_seg->vmaddr;
+                            addrs[i] += new_prelink_data_base + kext->data_off;
+                        } else if (addrs[i] >= kext_data_const_seg->vmaddr && addrs[i] < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
+                            // printf("Data in __DATA_CONST, addr: %llx\n", addrs[i]);
+                            addrs[i] -= kext_data_const_seg->vmaddr;
+                            addrs[i] += new_prelink_data_const_base + kext->data_const_off;
                         }
                     }
 
@@ -610,7 +631,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                         patch_addr = off + imm - kext_text_seg->vmaddr;
                                         patch_addr += new_prelink_text_base + kext->text_off;
                                     } else if (imm >= kext_text_exec_seg->vmaddr && imm < kext_text_exec_seg->vmaddr + kext_text_exec_seg->vmsize) {
-                                        patch_addr = imm - kext_text_exec_seg->vmaddr;
+                                        patch_addr = off + imm - kext_text_exec_seg->vmaddr;
                                         patch_addr += new_prelink_text_exec_base + kext->text_exec_off;
                                     } else if (imm >= kext_data_seg->vmaddr && imm < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
                                         patch_addr = off + imm - kext_data_seg->vmaddr;
@@ -639,7 +660,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                                         const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
                                         int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
                                         const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
-                                        // printf("%s %s\n", reg1_name, reg2_name);
+                                        // printf("%s %s, %llx\n", reg1_name, reg2_name, insn[i+1].address);
                                         sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
                                         // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
                                     } else if (strstr(insn[i + 1].mnemonic, "add")) {
@@ -677,9 +698,50 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kerenl)
                     }
                 }
 
+                // 处理外部符号
+                struct dysymtab_command* kext_dysymtab = (struct dysymtab_command*)find_command((mach_header_64_t*)((uint64_t)prelink_text_buf + kext->text_off), LC_DYSYMTAB);
+                if (kext->is_from_file && kext_dysymtab) {
+                    segment_command_64_t* kext_linkedit_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__LINKEDIT");
+                    if (kext_linkedit_seg) {
+                        struct relocation_info* ext_ri = (struct relocation_info*)((uint64_t)kext->exec_macho->file_buf + kext_dysymtab->extreloff);
+
+                        for (int i = 0; i < kext_dysymtab->nextrel; i++) {
+                            if (ext_ri[i].r_extern == 1) {
+                                const char* symbol_name = NULL;
+                                if (ext_ri[i].r_symbolnum < kext->exec_macho->symbol_count)
+                                    symbol_name = kext->exec_macho->symbol_list[ext_ri[i].r_symbolnum]->symbol_name;
+
+                                if (!symbol_name)
+                                    continue;
+                                // printf("symbol at %llx\n", ext_ri[i].r_address);
+                                if (!strcmp(symbol_name, "_sysctl__kern_children")) {
+                                    printf("@>???   %llx\n", ext_ri[i].r_address);
+                                }
+                                if (y_kernel.symbol_name_map.find(symbol_name) == y_kernel.symbol_name_map.end()) {
+                                    printf("Not found symbol %s\n", symbol_name);
+                                } else {
+                                    Symbol* symbol = y_kernel.symbol_name_map[symbol_name];
+                                    if (symbol->symbol_addr) {
+                                        uint64_t* patch_symbol = NULL;
+                                        if (ext_ri[i].r_address >= kext_data_const_seg->vmaddr && ext_ri[i].r_address < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
+                                            // patch_symbol -= kext_data_const_seg->vmaddr;
+                                            // printf("PP: %llx\n", (ext_ri[i].r_address - kext_data_const_seg->vmaddr));
+                                            patch_symbol = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + ext_ri[i].r_address - kext_data_const_seg->vmaddr);
+                                            *patch_symbol = symbol->symbol_addr;
+                                        } else if (ext_ri[i].r_address >= kext_data_seg->vmaddr && ext_ri[i].r_address < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
+                                            patch_symbol = (uint64_t*)((uint64_t)prelink_data_buf + kext->data_off + ext_ri[i].r_address - kext_data_seg->vmaddr);
+                                            *patch_symbol = symbol->symbol_addr;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 清空symtab
                 struct symtab_command* kext_symtab = (struct symtab_command*)find_command((mach_header_64_t*)((uint64_t)prelink_text_buf + kext->text_off), LC_SYMTAB);
-                struct dysymtab_command* kext_dysymtab = (struct dysymtab_command*)find_command((mach_header_64_t*)((uint64_t)prelink_text_buf + kext->text_off), LC_DYSYMTAB);
+                // struct dysymtab_command* kext_dysymtab = (struct dysymtab_command*)find_command((mach_header_64_t*)((uint64_t)prelink_text_buf + kext->text_off), LC_DYSYMTAB);
                 if (kext_symtab) {
                     printf("Found kext symtab\n");
                     kext_symtab->nsyms = 0;

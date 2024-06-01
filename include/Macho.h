@@ -227,6 +227,18 @@ struct dysymtab_command
 #define N_TYPE 0x0e /* mask for the type bits */
 #define N_EXT 0x01  /* external symbol bit, set for external symbols */
 
+struct relocation_info
+{
+    int32_t r_address;         /* offset in the section to what is being
+                          relocated */
+    uint32_t r_symbolnum : 24, /* symbol index if r_extern == 1 or section
+                  ordinal if r_extern == 0 */
+        r_pcrel : 1,           /* was relocated pc relative already */
+        r_length : 2,          /* 0=byte, 1=word, 2=long, 3=quad */
+        r_extern : 1,          /* does not include value of sym referenced */
+        r_type : 4;            /* if not 0, machine specific relocation type */
+};
+
 struct nlist_64
 {
     union
