@@ -155,6 +155,22 @@ void* Macho::find_segment(const char* segment_name)
     return NULL;
 }
 
+bool Macho::addr_in_segment(const char *segment_name, uint64_t addr)
+{
+    segment_command_64_t *found_segment = (segment_command_64_t *)find_segment(segment_name);
+    if(!found_segment)
+        return false;
+    
+    return (addr >= found_segment->vmaddr && addr < found_segment->vmaddr + found_segment->vmsize);
+}
+
+bool Macho::addr_in_segment(segment_command_64_t *seg, uint64_t addr)
+{
+    if(!seg)
+        return false;
+    return (addr >= seg->vmaddr && addr < seg->vmaddr + seg->vmsize);
+}
+
 Macho::Macho()
 {
 }

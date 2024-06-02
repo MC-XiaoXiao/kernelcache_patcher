@@ -333,6 +333,8 @@ public:
     void copy_from_file(uint64_t offset, char *targetBuff, size_t size);
     void *find_segment(const char *segment_name);
     void *find_section(const char *segname, const char *section_name);
+    bool addr_in_segment(const char *segment_name, uint64_t addr);
+    bool addr_in_segment(segment_command_64_t *seg, uint64_t addr);
 	load_command *find_command(uint32_t cmd);
 
 	Macho();
