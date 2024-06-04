@@ -614,7 +614,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                     section_64_t* kext_text_const_sect = (section_64*)kext->exec_macho->find_section("__TEXT", "__const");
                     section_64_t* kext_const_sect = (section_64*)kext->exec_macho->find_section("__DATA_CONST", "__const");
                     uint64_t* addrs = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + kext_const_sect->addr - kext_data_const_seg->vmaddr);
-                    for (size_t i = 0; i < kext_const_sect->size / sizeof(uint64_t); i++) {
+                    for (size_t i = 0; i < (kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize - kext_const_sect->addr) / sizeof(uint64_t); i++) {
                         if (addrs[i] >= kext_text_seg->vmaddr && addrs[i] < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
                             // printf("Data in __TEXT, addr: %llx\n", addrs[i]);
                             if (kext->is_from_file) {
@@ -682,44 +682,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                         printf("Not found kernel symbol(%s)\n", need_symbol_name);
                                     }
                                 }
-                            }
-                        }
-                    }
-
-                    section_64_t* kalloc_type_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__kalloc_type");
-                    if (kalloc_type_sect) {
-                        kalloc_type_view_t kalloc_types = (kalloc_type_view_t)((uint64_t)prelink_data_const_buf + kext->data_const_off + kalloc_type_sect->addr - kext_data_const_seg->vmaddr);
-                        for (size_t i = 0; i < kalloc_type_sect->size / sizeof(struct kalloc_type_view); i++) {
-                            if (kalloc_types[i].kt_zv.zv_name) {
-                                kalloc_types[i].kt_zv.zv_name -= kext_text_seg->vmaddr;
-                                kalloc_types[i].kt_zv.zv_name += kext->text_off + new_prelink_text_base;
-                            }
-
-                            if (kalloc_types[i].kt_signature) {
-                                kalloc_types[i].kt_signature -= kext_text_seg->vmaddr;
-                                kalloc_types[i].kt_signature += kext->text_off + new_prelink_text_base;
-                            }
-                        }
-                    }
-
-                    section_64_t* kalloc_type_var_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__kalloc_var");
-                    if (kalloc_type_var_sect) {
-                        kalloc_type_var_view_t kalloc_type_vars = (kalloc_type_var_view_t)((uint64_t)prelink_data_const_buf + kext->data_const_off + kalloc_type_var_sect->addr - kext_data_const_seg->vmaddr);
-                        for (size_t i = 0; i < kalloc_type_var_sect->size / sizeof(struct kalloc_type_var_view); i++) {
-                            if (kalloc_type_vars[i].kt_name) {
-                                // printf("%llx\n", kalloc_type_vars[i].kt_name);
-                                kalloc_type_vars[i].kt_name -= kext_text_seg->vmaddr;
-                                kalloc_type_vars[i].kt_name += kext->text_off + new_prelink_text_base;
-                            }
-
-                            if (kalloc_type_vars[i].kt_sig_hdr) {
-                                kalloc_type_vars[i].kt_sig_hdr -= kext_text_seg->vmaddr;
-                                kalloc_type_vars[i].kt_sig_hdr += kext->text_off + new_prelink_text_base;
-                            }
-
-                            if (kalloc_type_vars[i].kt_sig_type) {
-                                kalloc_type_vars[i].kt_sig_type -= kext_text_seg->vmaddr;
-                                kalloc_type_vars[i].kt_sig_type += kext->text_off + new_prelink_text_base;
                             }
                         }
                     }
