@@ -155,6 +155,10 @@ int main(int argc, char** argv)
     std::ofstream output_file_fs(output_path, std::ios::binary);
     output_file_fs.write(y_kernel.file_buf, y_kernel.file_size);
     output_file_fs.close();
+
+    printf("Finish!\n");
+
+    return 0;
 }
 
 uint32_t get_prelink_text_size(KernelMacho& kernel)
@@ -529,7 +533,52 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                             // printf("Data in __DATA_CONST, addr: %llx\n", addrs[i]);
                             addrs[i] -= kext_data_const_seg->vmaddr;
                             addrs[i] += new_prelink_data_const_base + kext->data_const_off;
+                        } else if (!kext->is_from_file) {
+                            if (addrs[i]) {
+                                if (!i_kernel.symbol_addr_map[addrs[i]]) {
+                                    bool found_symbol = false;
+                                    // 找不到再从i_kernel的kext里面找
+                                    for (size_t j = 0; j < kext->depends.size(); j++) {
+                                        if (!kext->depends[j]->is_from_file) {
+                                            segment_command_64_t* dep_text_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT");
+                                            segment_command_64_t* dep_text_exec_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT_EXEC");
+                                            segment_command_64_t* dep_data_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA");
+                                            segment_command_64_t* dep_data_const_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA_CONST");
+
+                                            if (addrs[i] >= dep_text_seg->vmaddr && addrs[i] < dep_text_seg->vmaddr + dep_text_seg->vmsize) {
+                                                addrs[i] -= dep_text_seg->vmaddr;
+                                                addrs[i] += new_prelink_text_base + kext->depends[j]->text_off;
+                                                found_symbol = true;
+                                            } else if (addrs[i] >= dep_text_exec_seg->vmaddr && addrs[i] < dep_text_exec_seg->vmaddr + dep_text_exec_seg->vmsize) {
+                                                addrs[i] -= dep_text_exec_seg->vmaddr;
+                                                addrs[i] += new_prelink_text_exec_base + kext->depends[j]->text_exec_off;
+                                                found_symbol = true;
+                                            } else if (addrs[i] >= dep_data_seg->vmaddr && addrs[i] < dep_data_seg->vmaddr + dep_data_seg->vmsize) {
+                                                addrs[i] -= dep_data_seg->vmaddr;
+                                                addrs[i] += new_prelink_data_base + kext->depends[j]->data_off;
+                                                found_symbol = true;
+                                            } else if (addrs[i] >= dep_data_const_seg->vmaddr && addrs[i] < dep_data_const_seg->vmaddr + dep_data_const_seg->vmsize) {
+                                                addrs[i] -= dep_data_const_seg->vmaddr;
+                                                addrs[i] += new_prelink_data_const_base + kext->depends[j]->data_const_off;
+                                                found_symbol = true;
+                                            }
+                                        }
+                                    }
+                                    if (!found_symbol)
+                                        if (addrs[i] >= i_prelink_text_segment->vmaddr && addrs[i] < i_prelink_data_segment->vmaddr + i_prelink_data_segment->vmsize)
+                                            printf("Not found kernel symbol %llx at 0x%llx\n", addrs[i], kext_data_seg->vmaddr + i * sizeof(uint64_t));
+                                } else {
+                                    const char* need_symbol_name = i_kernel.symbol_addr_map[addrs[i]]->symbol_name;
+                                    if (y_kernel.symbol_name_map[need_symbol_name]) {
+                                        // printf("%s\n", i_kernel.symbol_addr_map[addrs[i]]->symbol_name);
+                                        addrs[i] = y_kernel.symbol_name_map[need_symbol_name]->symbol_addr;
+                                    } else {
+                                        printf("Not found kernel symbol(%s)\n", need_symbol_name);
+                                    }
+                                }
+                            }
                         }
+                        // i_kernel!!!
                     }
                 }
 
@@ -754,28 +803,68 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                     uint64_t patch_addr = 0;
 
                                     uint64_t off = 0;
-
+                                    uint64_t old_off = 0;
+                                    std::vector<uint64_t> addr_indexs;
+                                    bool found_next = false;
                                     if (strstr(insn[i + 1].mnemonic, "ldr")) {
                                         int next_cmd_off_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
                                         off = insn[i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
+                                        found_next = true;
                                     } else if (strstr(insn[i + 1].mnemonic, "add")) {
                                         off = getSingleIMM(handle, &insn[i + 1]);
+                                        found_next = true;
                                     } else if (strstr(insn[i + 1].mnemonic, "str")) {
                                         int next_cmd_off_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
                                         off = insn[i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
+                                        found_next = true;
                                     } else {
-                                        printf("Unprocessed instructions %s at %llx\n", insn[i + 1].mnemonic, insn[i + 1].address);
-                                        for (size_t j = 0; j < 20; j++) {
+                                        printf("%d: Unprocessed instructions %s at %llx\n", __LINE__, insn[i].mnemonic, insn[i].address);
+                                        // 在下一个ADRP之前找到匹配的
+                                        uint64_t tmp_off = 0;
+                                        bool find_first_off = false;
+                                        bool found = false;
+                                        for (size_t j = 1; strcmp(insn[j + i + 1].mnemonic, "adrp") && j + i + 1 < count; j++) {
                                             // printf("%llx\n", insn[i + j + 1].address);
                                             // printf("%x %x\n", insn[j].detail->regs_read_count, insn[j + i + 1].detail->arm64.operands[1].reg);
-                                            if (j + i + 1 < count && insn[j + i + 1].detail)
+                                            if (insn[j + i + 1].detail)
                                                 if (insn[j + i + 1].detail->arm64.operands[1].reg == insn[i].detail->arm64.operands[reg_index].reg) {
-                                                    printf("!Found\n");
-                                                    break;
+                                                    if (strstr(insn[j + i + 1].mnemonic, "ldr")) {
+                                                        int next_cmd_off_index = cs_op_index(handle, &insn[j + i + 1], ARM64_OP_MEM, 1);
+                                                        tmp_off = insn[j + i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
+                                                        found = true;
+                                                    } else if (strstr(insn[j + i + 1].mnemonic, "add")) {
+                                                        tmp_off = getSingleIMM(handle, &insn[j + i + 1]);
+                                                        found = true;
+                                                    } else if (strstr(insn[j + i + 1].mnemonic, "str")) {
+                                                        int next_cmd_off_index = cs_op_index(handle, &insn[j + i + 1], ARM64_OP_MEM, 1);
+                                                        tmp_off = insn[j + i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
+                                                        found = true;
+                                                    }
+                                                    if (found) {
+                                                        if (!find_first_off) {
+                                                            printf("!Found at %llx\n", insn[j + i + 1].address);
+                                                            off = tmp_off;
+                                                            find_first_off = true;
+                                                        }
+
+                                                        if (off == tmp_off) {
+                                                            printf("!Found at %llx\n", insn[j + i + 1].address);
+                                                            addr_indexs.push_back(j + i + 1);
+                                                        }
+                                                    }
                                                 }
                                         }
+                                        if (!found) {
+                                            printf("Unprocessed instructions %s at %llx\n", insn[i + 1].mnemonic, insn[i + 1].address);
+                                            continue;
+                                        } else {
 
-                                        continue;
+                                            found_next = true;
+                                        }
+                                    }
+
+                                    if (off) {
+                                        old_off = off;
                                     }
 
                                     if (off + imm >= kext_text_seg->vmaddr && off + imm < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
@@ -803,48 +892,94 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                     sprintf(new_insn, "adrp %s, 0x%llx", write_reg, patch_addr);
                                     uint64_t insn_addr = insn[i].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
                                     // printf("%llx\n", insn_addr);
-                                    ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count);
-                                    for (size_t j = 0; j < encode_size; j++) {
-                                        ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
-                                    }
-
-                                    if (!strcmp(insn[i + 1].mnemonic, "ldr")) {
-                                        int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
-                                        const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
-                                        int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                        const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
-                                        // printf("%s %s, %llx\n", reg1_name, reg2_name, insn[i+1].address);
-                                        sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
-                                        // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                    } else if (!strcmp(insn[i + 1].mnemonic, "add")) {
-                                        int rcount = cs_op_count(handle, &insn[i + 1], ARM64_OP_REG);
-                                        const char* reg1_name;
-                                        const char* reg2_name;
-                                        if (rcount == 2) {
-                                            int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
-                                            int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 2);
-                                            reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
-                                            reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].reg);
-                                        } else {
-                                            //
-                                        }
-                                        // printf("%s %s\n", reg1_name , reg2_name);
-                                        sprintf(new_insn, "add %s, %s, #0x%llx", reg1_name, reg2_name, off);
-                                    } else if (!strcmp(insn[i + 1].mnemonic, "str")) {
-                                        int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
-                                        const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
-                                        int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                        const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
-                                        sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
-                                    }
-
-                                    insn_addr = insn[i + 1].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
                                     if (ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
-                                        printf("Can not ks_asm code %s(0x%llx)\n", new_insn, insn[i + 1].address);
-                                        exit(-1);
+
                                     } else {
                                         for (size_t j = 0; j < encode_size; j++) {
                                             ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
+                                        }
+                                    }
+                                    if (found_next) {
+                                        if (!strcmp(insn[i + 1].mnemonic, "ldr")) {
+                                            int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
+                                            const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
+                                            int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
+                                            const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
+                                            // printf("%s %s, %llx\n", reg1_name, reg2_name, insn[i+1].address);
+                                            sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
+                                            // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
+                                        } else if (!strcmp(insn[i + 1].mnemonic, "add")) {
+                                            int rcount = cs_op_count(handle, &insn[i + 1], ARM64_OP_REG);
+                                            const char* reg1_name;
+                                            const char* reg2_name;
+                                            if (rcount == 2) {
+                                                int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
+                                                int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 2);
+                                                reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
+                                                reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].reg);
+                                            } else {
+                                                //
+                                            }
+                                            // printf("%s %s\n", reg1_name , reg2_name);
+                                            sprintf(new_insn, "add %s, %s, #0x%llx", reg1_name, reg2_name, off);
+                                        } else if (!strcmp(insn[i + 1].mnemonic, "str")) {
+                                            int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
+                                            const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
+                                            int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
+                                            const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
+                                            sprintf(new_insn, "str %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
+                                        } else {
+                                            for (auto index : addr_indexs) {
+                                                if (!strcmp(insn[index].mnemonic, "ldr")) {
+                                                    int reg1_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 1);
+                                                    const char* reg1_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg1_index].reg);
+                                                    int reg2_index = cs_op_index(handle, &insn[index], ARM64_OP_MEM, 1);
+                                                    const char* reg2_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg2_index].mem.base);
+                                                    // printf("%s %s, %llx\n", reg1_name, reg2_name, insn[i+1].address);
+                                                    sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
+                                                    // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
+                                                } else if (!strcmp(insn[index].mnemonic, "add")) {
+                                                    int rcount = cs_op_count(handle, &insn[index], ARM64_OP_REG);
+                                                    const char* reg1_name;
+                                                    const char* reg2_name;
+                                                    if (rcount == 2) {
+                                                        int reg1_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 1);
+                                                        int reg2_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 2);
+                                                        reg1_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg1_index].reg);
+                                                        reg2_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg2_index].reg);
+                                                    } else {
+                                                        //
+                                                    }
+                                                    // printf("%s %s\n", reg1_name , reg2_name);
+                                                    sprintf(new_insn, "add %s, %s, #0x%llx", reg1_name, reg2_name, off);
+                                                } else if (!strcmp(insn[index].mnemonic, "str")) {
+                                                    int reg1_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 1);
+                                                    const char* reg1_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg1_index].reg);
+                                                    int reg2_index = cs_op_index(handle, &insn[index], ARM64_OP_MEM, 1);
+                                                    const char* reg2_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg2_index].mem.base);
+                                                    sprintf(new_insn, "str %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
+                                                }
+
+                                                insn_addr = insn[index].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
+                                                if (ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
+                                                    printf("Can not ks_asm code %s(0x%llx)\n", new_insn, insn[index].address);
+                                                    exit(-1);
+                                                } else {
+                                                    for (size_t j = 0; j < encode_size; j++) {
+                                                        ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        insn_addr = insn[i + 1].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
+                                        if (ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
+                                            printf("Can not ks_asm code %s(0x%llx)\n", new_insn, insn[i + 1].address);
+                                            exit(-1);
+                                        } else {
+                                            for (size_t j = 0; j < encode_size; j++) {
+                                                ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
+                                            }
                                         }
                                     }
                                 }
@@ -872,29 +1007,29 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                 if (!strcmp(symbol_name, "_sysctl__kern_children")) {
                                     printf("@>???   %llx\n", ext_ri[i].r_address);
                                 }
-                                
+
                                 uint64_t found_addr = 0;
                                 if (y_kernel.symbol_name_map.find(symbol_name) == y_kernel.symbol_name_map.end()) {
                                     bool found_symbol = false;
                                     for (auto dep_kext : kext->depends) {
                                         if (dep_kext->exec_macho->symbol_name_map[symbol_name]) {
                                             // 处理符号地址
-                                            segment_command_64_t *dep_text_seg = (segment_command_64_t *)dep_kext->exec_macho->find_segment("__TEXT");
-                                            segment_command_64_t *dep_text_exec_seg = (segment_command_64_t *)dep_kext->exec_macho->find_segment("__TEXT_EXEC");
-                                            segment_command_64_t *dep_data_seg = (segment_command_64_t *)dep_kext->exec_macho->find_segment("__DATA");
-                                            segment_command_64_t *dep_data_const_seg = (segment_command_64_t *)dep_kext->exec_macho->find_segment("__DATA_CONST");
-                                            
+                                            segment_command_64_t* dep_text_seg = (segment_command_64_t*)dep_kext->exec_macho->find_segment("__TEXT");
+                                            segment_command_64_t* dep_text_exec_seg = (segment_command_64_t*)dep_kext->exec_macho->find_segment("__TEXT_EXEC");
+                                            segment_command_64_t* dep_data_seg = (segment_command_64_t*)dep_kext->exec_macho->find_segment("__DATA");
+                                            segment_command_64_t* dep_data_const_seg = (segment_command_64_t*)dep_kext->exec_macho->find_segment("__DATA_CONST");
+
                                             uint64_t found_addr = dep_kext->exec_macho->symbol_name_map[symbol_name]->symbol_addr;
-                                            if(dep_kext->exec_macho->addr_in_segment(dep_text_seg, found_addr)) {
+                                            if (dep_kext->exec_macho->addr_in_segment(dep_text_seg, found_addr)) {
                                                 found_addr -= dep_text_seg->vmaddr;
                                                 found_addr += new_prelink_text_base + dep_kext->text_off;
-                                            } else if(dep_kext->exec_macho->addr_in_segment(dep_text_exec_seg, found_addr)) {
+                                            } else if (dep_kext->exec_macho->addr_in_segment(dep_text_exec_seg, found_addr)) {
                                                 found_addr -= dep_text_exec_seg->vmaddr;
                                                 found_addr += new_prelink_text_base + dep_kext->text_exec_off;
-                                            } else if(dep_kext->exec_macho->addr_in_segment(dep_data_seg, found_addr)) {
+                                            } else if (dep_kext->exec_macho->addr_in_segment(dep_data_seg, found_addr)) {
                                                 found_addr -= dep_data_seg->vmaddr;
                                                 found_addr += new_prelink_text_base + dep_kext->data_off;
-                                            } else if(dep_kext->exec_macho->addr_in_segment(dep_data_const_seg, found_addr)) {
+                                            } else if (dep_kext->exec_macho->addr_in_segment(dep_data_const_seg, found_addr)) {
                                                 found_addr -= dep_data_const_seg->vmaddr;
                                                 found_addr += new_prelink_text_base + dep_kext->data_const_off;
                                             }
@@ -907,24 +1042,23 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                         printf("Not found symbol %s\n", symbol_name);
                                 } else {
                                     Symbol* symbol = y_kernel.symbol_name_map[symbol_name];
-                                    if(symbol) {
+                                    if (symbol) {
                                         found_addr = symbol->symbol_addr;
                                     }
-                                    
                                 }
 
                                 if (found_addr) {
-                                        uint64_t* patch_symbol = NULL;
-                                        if (ext_ri[i].r_address >= kext_data_const_seg->vmaddr && ext_ri[i].r_address < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
-                                            // patch_symbol -= kext_data_const_seg->vmaddr;
-                                            // printf("PP: %llx\n", (ext_ri[i].r_address - kext_data_const_seg->vmaddr));
-                                            patch_symbol = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + ext_ri[i].r_address - kext_data_const_seg->vmaddr);
-                                            *patch_symbol = found_addr;
-                                        } else if (ext_ri[i].r_address >= kext_data_seg->vmaddr && ext_ri[i].r_address < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
-                                            patch_symbol = (uint64_t*)((uint64_t)prelink_data_buf + kext->data_off + ext_ri[i].r_address - kext_data_seg->vmaddr);
-                                            *patch_symbol = found_addr;
-                                        }
+                                    uint64_t* patch_symbol = NULL;
+                                    if (ext_ri[i].r_address >= kext_data_const_seg->vmaddr && ext_ri[i].r_address < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
+                                        // patch_symbol -= kext_data_const_seg->vmaddr;
+                                        // printf("PP: %llx\n", (ext_ri[i].r_address - kext_data_const_seg->vmaddr));
+                                        patch_symbol = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + ext_ri[i].r_address - kext_data_const_seg->vmaddr);
+                                        *patch_symbol = found_addr;
+                                    } else if (ext_ri[i].r_address >= kext_data_seg->vmaddr && ext_ri[i].r_address < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
+                                        patch_symbol = (uint64_t*)((uint64_t)prelink_data_buf + kext->data_off + ext_ri[i].r_address - kext_data_seg->vmaddr);
+                                        *patch_symbol = found_addr;
                                     }
+                                }
                             }
                         }
                     }
