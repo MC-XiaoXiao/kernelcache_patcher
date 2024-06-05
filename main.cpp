@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iostream>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
 #include <KernelMacho.h>
@@ -180,7 +181,7 @@ uint32_t get_prelink_text_size(KernelMacho& kernel)
     return size;
 }
 
-uint32_t get_prelink_segment_size(KernelMacho& kernel, const char* seg_name)
+uint32_t get_prelink_segment_size(KernelMacho& kernel, const char* seg_name, uint64_t align)
 {
     uint32_t size = 0;
 
@@ -188,7 +189,7 @@ uint32_t get_prelink_segment_size(KernelMacho& kernel, const char* seg_name)
         if (kext->exec_macho) {
             segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment(seg_name));
             if (text_exec_seg) {
-                size += ALIGN_UP(text_exec_seg->vmsize, SEG_ALIGN);
+                size += ALIGN_UP(text_exec_seg->vmsize, align);
             }
         }
     }
@@ -196,7 +197,7 @@ uint32_t get_prelink_segment_size(KernelMacho& kernel, const char* seg_name)
     return size;
 }
 
-void copy_segment_from_kext(Kext* kext, KernelMacho& i_kernel, const char* kext_segname, const char* kernel_segname, void* buf, uint64_t& off)
+void copy_segment_from_kext(Kext* kext, KernelMacho& i_kernel, const char* kext_segname, const char* kernel_segname, void* buf, uint64_t& off, uint64_t align)
 {
     uint64_t copy_des = 0;
     uint64_t copy_src = 0;
@@ -219,7 +220,7 @@ void copy_segment_from_kext(Kext* kext, KernelMacho& i_kernel, const char* kext_
         // printf("Copy 0x%016llx -> 0x%016llx(0x%08x)\n", copy_src, off, copy_size);
         memset((void*)copy_des, 0, copy_size);
         memcpy((char*)copy_des, (char*)copy_src, copy_size);
-        copy_size = ALIGN_UP(text_exec_seg->vmsize, SEG_ALIGN);
+        copy_size = ALIGN_UP(text_exec_seg->vmsize, align);
         off += copy_size;
     }
 }
@@ -358,13 +359,127 @@ uint64_t getSingleIMM(csh handle, const cs_insn* insn)
     return 0;
 }
 
+bool find_offs(
+    csh handle,
+    const cs_insn* insn,
+    uint64_t start,
+    uint64_t end,
+    uint32_t reg,
+    std::vector<int>& indexs,
+    uint32_t& off)
+{
+    std::unordered_set<int> used_addr;
+    bool find_first_off = false;
+    bool find_this_off = false;
+    uint32_t first_off = ~0;
+    uint32_t this_off = ~0;
+    uint32_t this_write_reg;
+    uint32_t this_read_reg;
+
+    for (size_t off_index = start + 1; off_index < end; off_index++) {
+        this_write_reg = 0;
+        this_read_reg = 0;
+        if (cs_insn_group(handle, &insn[off_index], CS_GRP_JUMP)) {
+            if (strstr(insn[off_index].mnemonic, "bl")) {
+                if (cs_op_count(handle, &insn[off_index], ARM64_OP_IMM) > 0) {
+                    uint64_t bl_next = getSingleIMM(handle, &insn[off_index]);
+                    if (used_addr.count(bl_next) == 0) {
+                        used_addr.insert(insn[off_index].address);
+                        // find_offs(handle, insn, off_index, end, reg, indexs);
+                    }
+                }
+                // off_index++;
+                continue;
+            } else if (!strcmp(insn[off_index].mnemonic, "ret")) {
+                break;
+            } else if (!strcmp(insn[off_index].mnemonic, "br")) {
+                break;
+            } else {
+                // printf("%s, 0x%llx\n", insn[off_index].mnemonic, insn[off_index].address);
+            }
+        } else if (!strcmp(insn[off_index].mnemonic, "adrp")) {
+            int reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+            if (reg == insn[off_index].detail->arm64.operands[reg_index].reg) {
+                // printf("Over\n");
+                break;
+            }
+        } else if (!strcmp(insn[off_index].mnemonic, "add")) {
+            int add_imm = getSingleIMM(handle, &insn[off_index]);
+
+            int read_reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 2);
+            this_read_reg = insn[off_index].detail->arm64.operands[read_reg_index].reg;
+
+            if (this_read_reg == reg) {
+                if (!find_first_off) {
+                    first_off = add_imm;
+                    find_first_off = true;
+                    // printf("Find first off at 0x%llx(0x%lx)\n", insn[off_index].address, first_off);
+                }
+                this_off = add_imm;
+                find_this_off = true;
+
+                int write_reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+                this_write_reg = insn[off_index].detail->arm64.operands[write_reg_index].reg;
+            }
+        } else if (strstr(insn[off_index].mnemonic, "ldr")) {
+            int ldr_off_index = cs_op_index(handle, &insn[off_index], ARM64_OP_MEM, 1);
+            uint32_t ldr_off = insn[off_index].detail->arm64.operands[ldr_off_index].mem.disp;
+            this_read_reg = insn[off_index].detail->arm64.operands[ldr_off_index].mem.base;
+
+            if (this_read_reg == reg) {
+                if (!find_first_off) {
+                    first_off = ldr_off;
+                    find_first_off = true;
+                    // printf("Find first off at 0x%llx(0x%lx)\n", insn[off_index].address, first_off);
+                }
+                this_off = ldr_off;
+                find_this_off = true;
+
+                // printf("Reg cound: %d\n", cs_op_count(handle, &insn[off_index], ARM64_OP_REG));
+                int reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+                this_write_reg = insn[off_index].detail->arm64.operands[reg_index].reg;
+            }
+        } else if (strstr(insn[off_index].mnemonic, "str")) {
+            int str_off_index = cs_op_index(handle, &insn[off_index], ARM64_OP_MEM, 1);
+            uint32_t str_off = insn[off_index].detail->arm64.operands[str_off_index].mem.disp;
+            this_read_reg = insn[off_index].detail->arm64.operands[str_off_index].mem.base;
+
+            if (this_read_reg == reg) {
+                if (!find_first_off) {
+                    first_off = str_off;
+                    find_first_off = true;
+                    // printf("Find first off at 0x%llx(0x%lx)\n", insn[off_index].address, first_off);
+                }
+                this_off = str_off;
+                find_this_off = true;
+            }
+        }
+
+        if (find_this_off) {
+            // 如果偏移量相同就添加进offs中
+            if (first_off == this_off && this_read_reg == reg) {
+                off = this_off;
+                // printf("Found off: 0x%lx 0x%llx\n", this_off, insn[off_index].address);
+                indexs.push_back(off_index);
+            }
+
+            if (reg == this_write_reg) {
+                // printf("Over: %llx\n", insn[off_index].address);
+                break;
+            }
+        }
+    }
+
+    return find_first_off;
+}
+
 void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
 {
     if (y_kernel.is_newer_ver) {
         uint32_t prelink_text_size = get_prelink_text_size(y_kernel);
-        uint32_t prelink_text_exec_size = get_prelink_segment_size(y_kernel, "__TEXT_EXEC");
-        uint32_t prelink_data_size = get_prelink_segment_size(y_kernel, "__DATA");
-        uint32_t prelink_data_const_size = get_prelink_segment_size(y_kernel, "__DATA_CONST");
+        uint32_t prelink_text_exec_size = get_prelink_segment_size(y_kernel, "__TEXT_EXEC", 1 << 12);
+        uint32_t prelink_data_size = get_prelink_segment_size(y_kernel, "__DATA", SEG_ALIGN);
+        uint32_t prelink_data_const_size = get_prelink_segment_size(y_kernel, "__DATA_CONST", SEG_ALIGN);
 
         printf("pre text size: %x\n", prelink_text_size);
         printf("pre text exec size: %x\n", prelink_text_exec_size);
@@ -410,11 +525,11 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                     }
                 }
                 kext->text_exec_off = kerenl_text_exec_off;
-                copy_segment_from_kext(kext, i_kernel, "__TEXT_EXEC", "__PLK_TEXT_EXEC", prelink_text_exec_buf, kerenl_text_exec_off);
+                copy_segment_from_kext(kext, i_kernel, "__TEXT_EXEC", "__PLK_TEXT_EXEC", prelink_text_exec_buf, kerenl_text_exec_off, 1 << 12);
                 kext->data_off = kerenl_data_off;
-                copy_segment_from_kext(kext, i_kernel, "__DATA", "__PRELINK_DATA", prelink_data_buf, kerenl_data_off);
+                copy_segment_from_kext(kext, i_kernel, "__DATA", "__PRELINK_DATA", prelink_data_buf, kerenl_data_off, SEG_ALIGN);
                 kext->data_const_off = kerenl_data_const_off;
-                copy_segment_from_kext(kext, i_kernel, "__DATA_CONST", "__PLK_DATA_CONST", prelink_data_const_buf, kerenl_data_const_off);
+                copy_segment_from_kext(kext, i_kernel, "__DATA_CONST", "__PLK_DATA_CONST", prelink_data_const_buf, kerenl_data_const_off, SEG_ALIGN);
             }
         }
 
@@ -747,7 +862,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
 
                     count = cs_disasm(handle, (const uint8_t*)kext_text_exec_buf_addr, kext_text_exec_seg->filesize, kext_text_exec_seg->vmaddr, 0, &insn);
                     printf("Count: %x\n");
-                    printf("Nedd: %x\n", kext_text_exec_seg->filesize / 4);
+                    // printf("Nedd: %x\n", kext_text_exec_seg->filesize / 4);
                     if (count > 0) {
                         for (size_t i = 0; i < count; i++) {
                             if (strstr(insn[i].mnemonic, "adrp")) {
@@ -764,69 +879,14 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                     const char* write_reg = cs_reg_name(handle, insn[i].detail->arm64.operands[reg_index].reg);
                                     uint64_t patch_addr = 0;
 
-                                    uint64_t off = 0;
-                                    uint64_t old_off = 0;
-                                    std::vector<uint64_t> addr_indexs;
-                                    bool found_next = false;
-                                    if (strstr(insn[i + 1].mnemonic, "ldr")) {
-                                        int next_cmd_off_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                        off = insn[i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
-                                        found_next = true;
-                                    } else if (strstr(insn[i + 1].mnemonic, "add")) {
-                                        off = getSingleIMM(handle, &insn[i + 1]);
-                                        found_next = true;
-                                    } else if (strstr(insn[i + 1].mnemonic, "str")) {
-                                        int next_cmd_off_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                        off = insn[i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
-                                        found_next = true;
-                                    } else {
-                                        printf("%d: Unprocessed instructions %s at %llx\n", __LINE__, insn[i].mnemonic, insn[i].address);
-                                        // 在下一个ADRP之前找到匹配的
-                                        uint64_t tmp_off = 0;
-                                        bool find_first_off = false;
-                                        bool found = false;
-                                        for (size_t j = 1; strcmp(insn[j + i + 1].mnemonic, "adrp") && j + i + 1 < count; j++) {
-                                            // printf("%llx\n", insn[i + j + 1].address);
-                                            // printf("%x %x\n", insn[j].detail->regs_read_count, insn[j + i + 1].detail->arm64.operands[1].reg);
-                                            if (insn[j + i + 1].detail)
-                                                if (insn[j + i + 1].detail->arm64.operands[1].reg == insn[i].detail->arm64.operands[reg_index].reg) {
-                                                    if (strstr(insn[j + i + 1].mnemonic, "ldr")) {
-                                                        int next_cmd_off_index = cs_op_index(handle, &insn[j + i + 1], ARM64_OP_MEM, 1);
-                                                        tmp_off = insn[j + i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
-                                                        found = true;
-                                                    } else if (strstr(insn[j + i + 1].mnemonic, "add")) {
-                                                        tmp_off = getSingleIMM(handle, &insn[j + i + 1]);
-                                                        found = true;
-                                                    } else if (strstr(insn[j + i + 1].mnemonic, "str")) {
-                                                        int next_cmd_off_index = cs_op_index(handle, &insn[j + i + 1], ARM64_OP_MEM, 1);
-                                                        tmp_off = insn[j + i + 1].detail->arm64.operands[next_cmd_off_index].mem.disp;
-                                                        found = true;
-                                                    }
-                                                    if (found) {
-                                                        if (!find_first_off) {
-                                                            printf("!Found at %llx\n", insn[j + i + 1].address);
-                                                            off = tmp_off;
-                                                            find_first_off = true;
-                                                        }
-
-                                                        if (off == tmp_off) {
-                                                            printf("!Found at %llx\n", insn[j + i + 1].address);
-                                                            addr_indexs.push_back(j + i + 1);
-                                                        }
-                                                    }
-                                                }
-                                        }
-                                        if (!found) {
-                                            printf("Unprocessed instructions %s at %llx\n", insn[i + 1].mnemonic, insn[i + 1].address);
-                                            continue;
-                                        } else {
-
-                                            found_next = true;
-                                        }
-                                    }
-
-                                    if (off) {
-                                        old_off = off;
+                                    // 寻找匹配的off
+                                    std::vector<int> off_indexs;
+                                    uint32_t off = 0;
+                                    // printf("Found next for 0x%llx\n", insn[i].address);
+                                    bool find_off = find_offs(handle, insn, i, count, insn[i].detail->arm64.operands[reg_index].reg, off_indexs, off);
+                                    if (!find_off) {
+                                        printf("Not found offs for 0x%llx\n", insn[i].address);
+                                        off = 0;
                                     }
 
                                     if (off + imm >= kext_text_seg->vmaddr && off + imm < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
@@ -843,7 +903,8 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                         patch_addr = off + imm - kext_data_const_seg->vmaddr;
                                         patch_addr += new_prelink_data_const_base + kext->data_const_off;
                                     } else {
-                                        printf("Unknow patch addr: 0x%llx at 0x%llx\n", imm, insn[i].address);
+                                        printf("Unknow patch addr: 0x%llx at 0x%llx\n", imm + off, insn[i].address);
+                                        continue;
                                     }
                                     off = patch_addr & 0xFFF;
                                     // printf("Addr: %llx\n", patch_addr);
@@ -861,86 +922,46 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                             ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
                                         }
                                     }
-                                    if (found_next) {
-                                        if (!strcmp(insn[i + 1].mnemonic, "ldr")) {
-                                            int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
-                                            const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
-                                            int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                            const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
-                                            // printf("%s %s, %llx\n", reg1_name, reg2_name, insn[i+1].address);
-                                            sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
-                                            // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                        } else if (!strcmp(insn[i + 1].mnemonic, "add")) {
-                                            int rcount = cs_op_count(handle, &insn[i + 1], ARM64_OP_REG);
-                                            const char* reg1_name;
-                                            const char* reg2_name;
-                                            if (rcount == 2) {
-                                                int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
-                                                int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 2);
-                                                reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
-                                                reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].reg);
+
+                                    // 处理匹配的off
+                                    if (find_off) {
+                                        for (auto off_index : off_indexs) {
+                                            if (!strcmp(insn[off_index].mnemonic, "add")) {
+                                                int rcount = cs_op_count(handle, &insn[off_index], ARM64_OP_REG);
+                                                const char* reg1_name;
+                                                const char* reg2_name;
+                                                if (rcount == 2) {
+                                                    int reg1_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+                                                    int reg2_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 2);
+                                                    reg1_name = cs_reg_name(handle, insn[off_index].detail->arm64.operands[reg1_index].reg);
+                                                    reg2_name = cs_reg_name(handle, insn[off_index].detail->arm64.operands[reg2_index].reg);
+
+                                                    sprintf(new_insn, "add %s, %s, #0x%lx", reg1_name, reg2_name, off);
+                                                }
+                                            } else if (strstr(insn[off_index].mnemonic, "ldr")) {
+                                                int reg1_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+                                                const char* reg1_name = cs_reg_name(handle, insn[off_index].detail->arm64.operands[reg1_index].reg);
+                                                int reg2_index = cs_op_index(handle, &insn[off_index], ARM64_OP_MEM, 1);
+                                                const char* reg2_name = cs_reg_name(handle, insn[off_index].detail->arm64.operands[reg2_index].mem.base);
+
+                                                sprintf(new_insn, "%s %s, [%s, #0x%lx]", insn[off_index].mnemonic, reg1_name, reg2_name, off);
+                                            } else if (strstr(insn[off_index].mnemonic, "str")) {
+                                                int reg1_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+                                                const char* reg1_name = cs_reg_name(handle, insn[off_index].detail->arm64.operands[reg1_index].reg);
+                                                int reg2_index = cs_op_index(handle, &insn[off_index], ARM64_OP_MEM, 1);
+                                                const char* reg2_name = cs_reg_name(handle, insn[off_index].detail->arm64.operands[reg2_index].mem.base);
+
+                                                sprintf(new_insn, "%s %s, [%s, #0x%lx]", insn[off_index].mnemonic, reg1_name, reg2_name, off);
+                                            }
+
+                                            insn_addr = insn[off_index].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
+                                            if (ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
+                                                printf("Can not ks_asm code %s(0x%llx)\n", new_insn, insn[off_index].address);
+                                                exit(-1);
                                             } else {
-                                                //
-                                            }
-                                            // printf("%s %s\n", reg1_name , reg2_name);
-                                            sprintf(new_insn, "add %s, %s, #0x%llx", reg1_name, reg2_name, off);
-                                        } else if (!strcmp(insn[i + 1].mnemonic, "str")) {
-                                            int reg1_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_REG, 1);
-                                            const char* reg1_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg1_index].reg);
-                                            int reg2_index = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                            const char* reg2_name = cs_reg_name(handle, insn[i + 1].detail->arm64.operands[reg2_index].mem.base);
-                                            sprintf(new_insn, "str %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
-                                        } else {
-                                            for (auto index : addr_indexs) {
-                                                if (!strcmp(insn[index].mnemonic, "ldr")) {
-                                                    int reg1_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 1);
-                                                    const char* reg1_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg1_index].reg);
-                                                    int reg2_index = cs_op_index(handle, &insn[index], ARM64_OP_MEM, 1);
-                                                    const char* reg2_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg2_index].mem.base);
-                                                    // printf("%s %s, %llx\n", reg1_name, reg2_name, insn[i+1].address);
-                                                    sprintf(new_insn, "ldr %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
-                                                    // const char *reg1 = cs_op_index(handle, &insn[i + 1], ARM64_OP_MEM, 1);
-                                                } else if (!strcmp(insn[index].mnemonic, "add")) {
-                                                    int rcount = cs_op_count(handle, &insn[index], ARM64_OP_REG);
-                                                    const char* reg1_name;
-                                                    const char* reg2_name;
-                                                    if (rcount == 2) {
-                                                        int reg1_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 1);
-                                                        int reg2_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 2);
-                                                        reg1_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg1_index].reg);
-                                                        reg2_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg2_index].reg);
-                                                    } else {
-                                                        //
-                                                    }
-                                                    // printf("%s %s\n", reg1_name , reg2_name);
-                                                    sprintf(new_insn, "add %s, %s, #0x%llx", reg1_name, reg2_name, off);
-                                                } else if (!strcmp(insn[index].mnemonic, "str")) {
-                                                    int reg1_index = cs_op_index(handle, &insn[index], ARM64_OP_REG, 1);
-                                                    const char* reg1_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg1_index].reg);
-                                                    int reg2_index = cs_op_index(handle, &insn[index], ARM64_OP_MEM, 1);
-                                                    const char* reg2_name = cs_reg_name(handle, insn[index].detail->arm64.operands[reg2_index].mem.base);
-                                                    sprintf(new_insn, "str %s, [%s, #0x%llx]", reg1_name, reg2_name, off);
+                                                for (size_t j = 0; j < encode_size; j++) {
+                                                    ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
                                                 }
-
-                                                insn_addr = insn[index].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
-                                                if (ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
-                                                    printf("Can not ks_asm code %s(0x%llx)\n", new_insn, insn[index].address);
-                                                    exit(-1);
-                                                } else {
-                                                    for (size_t j = 0; j < encode_size; j++) {
-                                                        ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        insn_addr = insn[i + 1].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
-                                        if (ks_asm(ks, new_insn, insn_addr, &encode, &encode_size, &stat_count)) {
-                                            printf("Can not ks_asm code %s(0x%llx)\n", new_insn, insn[i + 1].address);
-                                            exit(-1);
-                                        } else {
-                                            for (size_t j = 0; j < encode_size; j++) {
-                                                ((unsigned char*)((uint64_t)prelink_text_exec_buf + insn_addr - new_prelink_text_exec_base))[j] = encode[j];
                                             }
                                         }
                                     }
@@ -1073,19 +1094,19 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                             segment_command_64_t* seg = (segment_command_64_t*)lcd;
                             if (!strncmp(seg->segname, "__TEXT", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_base + kext->text_off, seg->filesize);
-                                printf("Kext %s __TEXT at 0x%llx\n", kext->kext_id, new_prelink_text_base + kext->text_off, seg->filesize);
+                                printf("Kext %s new __TEXT at 0x%llx\n", kext->kext_id, new_prelink_text_base + kext->text_off, seg->filesize);
                             } else if (!strncmp(seg->segname, "__TEXT_EXEC", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_text_exec_base + kext->text_exec_off, seg->vmsize);
-                                printf("Kext __TEXT_EXEC at 0x%llx\n", new_prelink_text_exec_base + kext->text_exec_off);
+                                printf("Kext new __TEXT_EXEC at 0x%llx\n", new_prelink_text_exec_base + kext->text_exec_off);
                                 patch_seg_fileoff((segment_command_64_t*)lcd, (new_prelink_text_exec_fileoff + kext->text_exec_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
                                 // printf("%p -- %p\n", (kerenl_text_exec_off + kext->text_exec_off), (new_prelink_text_fileoff + kext->text_off));
                             } else if (!strncmp(seg->segname, "__DATA", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_base + kext->data_off, seg->filesize);
-                                printf("Kext __DATA at 0x%llx\n", new_prelink_data_base + kext->data_off);
+                                printf("Kext new __DATA at 0x%llx\n", new_prelink_data_base + kext->data_off);
                                 patch_seg_fileoff((segment_command_64_t*)lcd, (new_prelink_data_fileoff + kext->data_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
                             } else if (!strncmp(seg->segname, "__DATA_CONST", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_data_const_base + kext->data_const_off, seg->filesize);
-                                printf("Kext __DATA_CONST at 0x%llx\n", new_prelink_data_const_base + kext->data_const_off);
+                                printf("Kext new __DATA_CONST at 0x%llx\n", new_prelink_data_const_base + kext->data_const_off);
                                 patch_seg_fileoff((segment_command_64_t*)lcd, (new_prelink_data_const_fileoff + kext->data_const_off) - (new_prelink_text_fileoff + kext->text_off), seg->filesize);
                             } else if (!strncmp(seg->segname, "__LINKEDIT", 16)) {
                                 patch_seg_vmbase((segment_command_64_t*)lcd, new_prelink_info_base, 0);
