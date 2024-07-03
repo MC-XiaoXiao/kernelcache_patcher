@@ -121,9 +121,11 @@ int main(int argc, char** argv)
 
     char tmp_symbol[255];
     while (symbol_list_fs.getline(tmp_symbol, 255)) {
+        if (kext_path[0] == '#' || kext_path[0] == ' ')
+            continue;
         uint64_t addr = 0;
         char* symbol_name = (char*)malloc(100);
-        printf("%s\n", tmp_symbol);
+        // printf("%s\n", tmp_symbol);
         sscanf(tmp_symbol, "%lx,%s", &addr, symbol_name);
         Symbol* symbol = new Symbol();
         symbol->symbol_addr = addr;
@@ -622,6 +624,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                     if (kext_kmod->start_addr) {
                         kext_kmod->start_addr -= kext_text_exec_seg->vmaddr;
                         kext_kmod->start_addr += new_prelink_text_exec_base + kext->text_exec_off;
+                        printf("k start at: 0x%llx\n", kext_kmod->start_addr);
                     }
                     if (kext_kmod->stop_addr) {
                         kext_kmod->stop_addr -= kext_text_exec_seg->vmaddr;
@@ -730,126 +733,152 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                     section_64_t* kext_cstring_sect = (section_64*)kext->exec_macho->find_section("__TEXT", "__cstring");
                     section_64_t* kext_text_const_sect = (section_64*)kext->exec_macho->find_section("__TEXT", "__const");
                     section_64_t* kext_const_sect = (section_64*)kext->exec_macho->find_section("__DATA_CONST", "__const");
-                    uint64_t* addrs = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + kext_const_sect->addr - kext_data_const_seg->vmaddr);
-                    for (size_t i = 0; i < (kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize - kext_const_sect->addr) / sizeof(uint64_t); i++) {
-                        if (addrs[i] >= kext_text_seg->vmaddr && addrs[i] < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
-                            // printf("Data in __TEXT, addr: %llx\n", addrs[i]);
-                            if (kext->is_from_file) {
-                                if (kext_cstring_sect && addrs[i] >= kext_cstring_sect->addr) {
+
+                    section_64_t* kext_got_sect = (section_64*)kext->exec_macho->find_section("__DATA_CONST", "__got");
+
+                    if (!kext_const_sect) {
+                        kext_const_sect = (section_64*)kext->exec_macho->find_section("__DATA_CONST", "__kalloc_type");
+                    }
+                    if (kext_const_sect) {
+                        uint64_t* addrs = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + kext_const_sect->addr - kext_data_const_seg->vmaddr);
+                        for (size_t i = 0; i < (kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize - kext_const_sect->addr) / sizeof(uint64_t); i++) {
+                            if (kext_got_sect && addrs[i] >= kext_got_sect->addr && addrs[i] < kext_got_sect->addr + kext_got_sect->size) {
+                                printf("?In?\n");
+                                continue;
+                            }
+                            if (addrs[i] >= kext_text_seg->vmaddr && addrs[i] < kext_text_seg->vmaddr + kext_text_seg->vmsize) {
+                                // printf("Data in __TEXT, addr: %llx\n", addrs[i]);
+                                if (kext->is_from_file) {
+                                    if (kext_cstring_sect && addrs[i] >= kext_cstring_sect->addr) {
+                                        addrs[i] -= kext_text_seg->vmaddr;
+                                        addrs[i] += new_prelink_text_base + kext->text_off;
+                                    }
+                                } else {
                                     addrs[i] -= kext_text_seg->vmaddr;
                                     addrs[i] += new_prelink_text_base + kext->text_off;
                                 }
-                            } else {
-                                addrs[i] -= kext_text_seg->vmaddr;
-                                addrs[i] += new_prelink_text_base + kext->text_off;
-                            }
 
-                        } else if (addrs[i] >= kext_text_exec_seg->vmaddr && addrs[i] < kext_text_exec_seg->vmaddr + kext_text_exec_seg->vmsize) {
-                            // printf("Data in __TEXT_EXEC, addr: %llx\n", addrs[i]);
-                            addrs[i] -= kext_text_exec_seg->vmaddr;
-                            addrs[i] += new_prelink_text_exec_base + kext->text_exec_off;
-                        } else if (addrs[i] >= kext_data_seg->vmaddr && addrs[i] < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
-                            // printf("Data in __DATA, addr: %llx\n", addrs[i]);
-                            addrs[i] -= kext_data_seg->vmaddr;
-                            addrs[i] += new_prelink_data_base + kext->data_off;
-                        } else if (addrs[i] >= kext_data_const_seg->vmaddr && addrs[i] < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
-                            // printf("Data in __DATA_CONST, addr: %llx\n", addrs[i]);
-                            addrs[i] -= kext_data_const_seg->vmaddr;
-                            addrs[i] += new_prelink_data_const_base + kext->data_const_off;
-                        } else if (!kext->is_from_file) {
-                            if (addrs[i]) {
-                                if (!i_kernel.symbol_addr_map[addrs[i]]) {
-                                    bool found_symbol = false;
-                                    // 找不到再从i_kernel的kext里面找
-                                    for (size_t j = 0; j < kext->depends.size(); j++) {
-                                        if (!kext->depends[j]->is_from_file) {
-                                            segment_command_64_t* dep_text_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT");
-                                            segment_command_64_t* dep_text_exec_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT_EXEC");
-                                            segment_command_64_t* dep_data_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA");
-                                            segment_command_64_t* dep_data_const_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA_CONST");
+                            } else if (addrs[i] >= kext_text_exec_seg->vmaddr && addrs[i] < kext_text_exec_seg->vmaddr + kext_text_exec_seg->vmsize) {
+                                // printf("Data in __TEXT_EXEC, addr: %llx\n", addrs[i]);
+                                addrs[i] -= kext_text_exec_seg->vmaddr;
+                                addrs[i] += new_prelink_text_exec_base + kext->text_exec_off;
+                            } else if (addrs[i] >= kext_data_seg->vmaddr && addrs[i] < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
+                                // printf("Data in __DATA, addr: %llx\n", addrs[i]);
+                                addrs[i] -= kext_data_seg->vmaddr;
+                                addrs[i] += new_prelink_data_base + kext->data_off;
+                            } else if (addrs[i] >= kext_data_const_seg->vmaddr && addrs[i] < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
+                                // printf("Data in __DATA_CONST, addr: %llx\n", addrs[i]);
+                                addrs[i] -= kext_data_const_seg->vmaddr;
+                                addrs[i] += new_prelink_data_const_base + kext->data_const_off;
+                            } else if (!kext->is_from_file) {
+                                if (addrs[i]) {
+                                    if (!i_kernel.symbol_addr_map[addrs[i]]) {
+                                        bool found_symbol = false;
+                                        // 找不到再从i_kernel的kext里面找
+                                        for (size_t j = 0; j < kext->depends.size(); j++) {
+                                            if (!kext->depends[j]->is_from_file) {
+                                                segment_command_64_t* dep_text_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT");
+                                                segment_command_64_t* dep_text_exec_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT_EXEC");
+                                                segment_command_64_t* dep_data_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA");
+                                                segment_command_64_t* dep_data_const_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA_CONST");
 
-                                            if (addrs[i] >= dep_text_seg->vmaddr && addrs[i] < dep_text_seg->vmaddr + dep_text_seg->vmsize) {
-                                                addrs[i] -= dep_text_seg->vmaddr;
-                                                addrs[i] += new_prelink_text_base + kext->depends[j]->text_off;
-                                                found_symbol = true;
-                                            } else if (addrs[i] >= dep_text_exec_seg->vmaddr && addrs[i] < dep_text_exec_seg->vmaddr + dep_text_exec_seg->vmsize) {
-                                                addrs[i] -= dep_text_exec_seg->vmaddr;
-                                                addrs[i] += new_prelink_text_exec_base + kext->depends[j]->text_exec_off;
-                                                found_symbol = true;
-                                            } else if (addrs[i] >= dep_data_seg->vmaddr && addrs[i] < dep_data_seg->vmaddr + dep_data_seg->vmsize) {
-                                                addrs[i] -= dep_data_seg->vmaddr;
-                                                addrs[i] += new_prelink_data_base + kext->depends[j]->data_off;
-                                                found_symbol = true;
-                                            } else if (addrs[i] >= dep_data_const_seg->vmaddr && addrs[i] < dep_data_const_seg->vmaddr + dep_data_const_seg->vmsize) {
-                                                addrs[i] -= dep_data_const_seg->vmaddr;
-                                                addrs[i] += new_prelink_data_const_base + kext->depends[j]->data_const_off;
-                                                found_symbol = true;
+                                                if (addrs[i] >= dep_text_seg->vmaddr && addrs[i] < dep_text_seg->vmaddr + dep_text_seg->vmsize) {
+                                                    addrs[i] -= dep_text_seg->vmaddr;
+                                                    addrs[i] += new_prelink_text_base + kext->depends[j]->text_off;
+                                                    found_symbol = true;
+                                                } else if (addrs[i] >= dep_text_exec_seg->vmaddr && addrs[i] < dep_text_exec_seg->vmaddr + dep_text_exec_seg->vmsize) {
+                                                    addrs[i] -= dep_text_exec_seg->vmaddr;
+                                                    addrs[i] += new_prelink_text_exec_base + kext->depends[j]->text_exec_off;
+                                                    found_symbol = true;
+                                                } else if (addrs[i] >= dep_data_seg->vmaddr && addrs[i] < dep_data_seg->vmaddr + dep_data_seg->vmsize) {
+                                                    addrs[i] -= dep_data_seg->vmaddr;
+                                                    addrs[i] += new_prelink_data_base + kext->depends[j]->data_off;
+                                                    found_symbol = true;
+                                                } else if (addrs[i] >= dep_data_const_seg->vmaddr && addrs[i] < dep_data_const_seg->vmaddr + dep_data_const_seg->vmsize) {
+                                                    addrs[i] -= dep_data_const_seg->vmaddr;
+                                                    addrs[i] += new_prelink_data_const_base + kext->depends[j]->data_const_off;
+                                                    found_symbol = true;
+                                                }
+
+                                                if(found_symbol)
+                                                    break;
                                             }
                                         }
-                                    }
-                                    if (!found_symbol)
-                                        if (addrs[i] >= i_prelink_text_segment->vmaddr && addrs[i] < i_prelink_data_segment->vmaddr + i_prelink_data_segment->vmsize)
-                                            printf("Not found kernel symbol %llx at 0x%llx\n", addrs[i], kext_const_sect->addr + i * sizeof(uint64_t));
-                                } else {
-                                    const char* need_symbol_name = i_kernel.symbol_addr_map[addrs[i]]->symbol_name;
-                                    if (y_kernel.symbol_name_map[need_symbol_name]) {
-                                        // printf("%s\n", i_kernel.symbol_addr_map[addrs[i]]->symbol_name);
-                                        addrs[i] = y_kernel.symbol_name_map[need_symbol_name]->symbol_addr;
+                                        if (!found_symbol)
+                                            if (addrs[i] >= i_prelink_text_segment->vmaddr && addrs[i] < i_prelink_data_segment->vmaddr + i_prelink_data_segment->vmsize)
+                                                printf("Not found kernel symbol %llx at 0x%llx\n", addrs[i], kext_const_sect->addr + i * sizeof(uint64_t));
                                     } else {
-                                        printf("Not found kernel symbol(%s)\n", need_symbol_name);
+                                        const char* need_symbol_name = i_kernel.symbol_addr_map[addrs[i]]->symbol_name;
+                                        if (y_kernel.symbol_name_map[need_symbol_name]) {
+                                            // printf("%s\n", i_kernel.symbol_addr_map[addrs[i]]->symbol_name);
+                                            addrs[i] = y_kernel.symbol_name_map[need_symbol_name]->symbol_addr;
+                                        } else {
+                                            printf("Not found kernel symbol(%s)\n", need_symbol_name);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    section_64_t* kext_got_sect = (section_64*)kext->exec_macho->find_section("__DATA_CONST", "__got");
-                    if (kext_got_sect) {
-                        if (!kext->is_from_file) {
-                            addrs = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + kext_got_sect->addr - kext_data_const_seg->vmaddr);
-                            for (size_t i = 0; i < kext_got_sect->size / sizeof(uint64_t); i++) {
-                                if (i_kernel.symbol_addr_map[addrs[i]]) {
-                                    const char* find_symbol_name = i_kernel.symbol_addr_map[addrs[i]]->symbol_name;
-                                    if (y_kernel.symbol_name_map[find_symbol_name]) {
-                                        addrs[i] = y_kernel.symbol_name_map[find_symbol_name]->symbol_addr;
+                        if (kext_got_sect) {
+                            if (!kext->is_from_file) {
+                                addrs = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + kext_got_sect->addr - kext_data_const_seg->vmaddr);
+                                for (size_t i = 0; i < kext_got_sect->size / sizeof(uint64_t); i++) {
+                                    if (i_kernel.symbol_addr_map[addrs[i]]) {
+                                        const char* find_symbol_name = i_kernel.symbol_addr_map[addrs[i]]->symbol_name;
+                                        if (y_kernel.symbol_name_map[find_symbol_name]) {
+                                            addrs[i] = y_kernel.symbol_name_map[find_symbol_name]->symbol_addr;
+                                        } else {
+                                            printf("Not fount symbol %s\n", find_symbol_name);
+                                        }
                                     } else {
-                                        printf("Not fount symbol %s\n", find_symbol_name);
-                                    }
-                                } else {
-                                    bool found_symbol = false;
-                                    // 找不到再从i_kernel的kext里面找
-                                    for (size_t j = 0; j < kext->depends.size(); j++) {
-                                        if (!kext->depends[j]->is_from_file) {
-                                            segment_command_64_t* dep_text_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT");
-                                            segment_command_64_t* dep_text_exec_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT_EXEC");
-                                            segment_command_64_t* dep_data_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA");
-                                            segment_command_64_t* dep_data_const_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA_CONST");
+                                        bool found_symbol = false;
+                                        // 找不到再从i_kernel的kext里面找
+                                        for (size_t j = 0; j < kext->depends.size(); j++) {
+                                            if (!kext->depends[j]->is_from_file) {
+                                                segment_command_64_t* dep_text_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT");
+                                                segment_command_64_t* dep_text_exec_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT_EXEC");
+                                                segment_command_64_t* dep_data_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA");
+                                                segment_command_64_t* dep_data_const_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA_CONST");
+                                                
 
-                                            if (addrs[i] >= dep_text_seg->vmaddr && addrs[i] < dep_text_seg->vmaddr + dep_text_seg->vmsize) {
-                                                addrs[i] -= dep_text_seg->vmaddr;
-                                                addrs[i] += new_prelink_text_base + kext->depends[j]->text_off;
-                                                found_symbol = true;
-                                            } else if (addrs[i] >= dep_text_exec_seg->vmaddr && addrs[i] < dep_text_exec_seg->vmaddr + dep_text_exec_seg->vmsize) {
-                                                addrs[i] -= dep_text_exec_seg->vmaddr;
-                                                addrs[i] += new_prelink_text_exec_base + kext->depends[j]->text_exec_off;
-                                                found_symbol = true;
-                                            } else if (addrs[i] >= dep_data_seg->vmaddr && addrs[i] < dep_data_seg->vmaddr + dep_data_seg->vmsize) {
-                                                addrs[i] -= dep_data_seg->vmaddr;
-                                                addrs[i] += new_prelink_data_base + kext->depends[j]->data_off;
-                                                found_symbol = true;
-                                            } else if (addrs[i] >= dep_data_const_seg->vmaddr && addrs[i] < dep_data_const_seg->vmaddr + dep_data_const_seg->vmsize) {
-                                                addrs[i] -= dep_data_const_seg->vmaddr;
-                                                addrs[i] += new_prelink_data_const_base + kext->depends[j]->data_const_off;
-                                                found_symbol = true;
+                                                
+                                                if (addrs[i] >= dep_text_seg->vmaddr && addrs[i] < dep_text_seg->vmaddr + dep_text_seg->vmsize) {
+                                                    addrs[i] -= dep_text_seg->vmaddr;
+                                                    addrs[i] += new_prelink_text_base + kext->depends[j]->text_off;
+                                                    found_symbol = true;
+                                                } else if (addrs[i] >= dep_text_exec_seg->vmaddr && addrs[i] < dep_text_exec_seg->vmaddr + dep_text_exec_seg->vmsize) {
+                                                    if(addrs[i] == 0xFFFFFFF005734A70) {
+                                                        printf("@@@@!!!!!!FFFFFFF005734A70 to %s\n", kext->depends[j]->kext_id);
+                                                        printf("Patch: %p\n", addrs[i] - dep_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->depends[j]->text_exec_off);
+                                                    }
+                                                    addrs[i] -= dep_text_exec_seg->vmaddr;
+                                                    addrs[i] += new_prelink_text_exec_base + kext->depends[j]->text_exec_off;
+                                                    found_symbol = true;
+                                                } else if (addrs[i] >= dep_data_seg->vmaddr && addrs[i] < dep_data_seg->vmaddr + dep_data_seg->vmsize) {
+                                                    addrs[i] -= dep_data_seg->vmaddr;
+                                                    addrs[i] += new_prelink_data_base + kext->depends[j]->data_off;
+                                                    found_symbol = true;
+                                                } else if (addrs[i] >= dep_data_const_seg->vmaddr && addrs[i] < dep_data_const_seg->vmaddr + dep_data_const_seg->vmsize) {
+                                                    addrs[i] -= dep_data_const_seg->vmaddr;
+                                                    addrs[i] += new_prelink_data_const_base + kext->depends[j]->data_const_off;
+                                                    found_symbol = true;
+                                                }
+
+                                                if(found_symbol) {
+                                                    break;
+                                                }
                                             }
                                         }
+                                        if (!found_symbol)
+                                            if (addrs[i] >= i_prelink_text_segment->vmaddr && addrs[i] < i_prelink_data_segment->vmaddr + i_prelink_data_segment->vmsize)
+                                                printf("%d:Not found kernel symbol %llx at 0x%llx\n", __LINE__, addrs[i], kext_got_sect->addr + i * sizeof(uint64_t));
                                     }
-                                    if (!found_symbol)
-                                        if (addrs[i] >= i_prelink_text_segment->vmaddr && addrs[i] < i_prelink_data_segment->vmaddr + i_prelink_data_segment->vmsize)
-                                            printf("%d:Not found kernel symbol %llx at 0x%llx\n", __LINE__, addrs[i], kext_const_sect->addr + i * sizeof(uint64_t));
                                 }
                             }
                         }
+                    } else {
+                        printf("Kext not have __DATA_CONST.__const\n");
                     }
                 }
 
@@ -1006,13 +1035,13 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                                 found_addr += new_prelink_text_base + dep_kext->text_off;
                                             } else if (dep_kext->exec_macho->addr_in_segment(dep_text_exec_seg, found_addr)) {
                                                 found_addr -= dep_text_exec_seg->vmaddr;
-                                                found_addr += new_prelink_text_base + dep_kext->text_exec_off;
+                                                found_addr += new_prelink_text_exec_base + dep_kext->text_exec_off;
                                             } else if (dep_kext->exec_macho->addr_in_segment(dep_data_seg, found_addr)) {
                                                 found_addr -= dep_data_seg->vmaddr;
-                                                found_addr += new_prelink_text_base + dep_kext->data_off;
+                                                found_addr += new_prelink_data_base + dep_kext->data_off;
                                             } else if (dep_kext->exec_macho->addr_in_segment(dep_data_const_seg, found_addr)) {
                                                 found_addr -= dep_data_const_seg->vmaddr;
-                                                found_addr += new_prelink_text_base + dep_kext->data_const_off;
+                                                found_addr += new_prelink_data_const_base + dep_kext->data_const_off;
                                             } else {
                                                 printf("Symbol %s out range\n", symbol_name);
                                                 continue;
@@ -1032,7 +1061,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                         printf("symbol not in kernel\n");
                                     }
                                 }
-                                
+
                                 if (found_addr) {
                                     uint64_t* patch_symbol = NULL;
                                     if (ext_ri[i].r_address >= kext_data_const_seg->vmaddr && ext_ri[i].r_address < kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize) {
@@ -1040,7 +1069,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                         // printf("PP: %llx\n", (ext_ri[i].r_address - kext_data_const_seg->vmaddr));
                                         patch_symbol = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + ext_ri[i].r_address - kext_data_const_seg->vmaddr);
                                         *patch_symbol = found_addr;
-                                        printf("Patch addr: 0x%llx\n", (uint64_t)patch_symbol - (uint64_t)prelink_data_const_buf + new_prelink_data_const_base);
+                                        // printf("Patch addr: 0x%llx\n", (uint64_t)patch_symbol - (uint64_t)prelink_data_const_buf + new_prelink_data_const_base);
                                     } else if (ext_ri[i].r_address >= kext_data_seg->vmaddr && ext_ri[i].r_address < kext_data_seg->vmaddr + kext_data_seg->vmsize) {
                                         patch_symbol = (uint64_t*)((uint64_t)prelink_data_buf + kext->data_off + ext_ri[i].r_address - kext_data_seg->vmaddr);
                                         *patch_symbol = found_addr;
