@@ -336,6 +336,7 @@ public:
     bool addr_in_segment(const char *segment_name, uint64_t addr);
     bool addr_in_segment(segment_command_64_t *seg, uint64_t addr);
 	load_command *find_command(uint32_t cmd);
+    uint32_t get_fileoff(uint64_t vmaddr);
 
 	Macho();
 	Macho(char *buf, uint32_t file_size);

@@ -171,6 +171,40 @@ bool Macho::addr_in_segment(segment_command_64_t *seg, uint64_t addr)
     return (addr >= seg->vmaddr && addr < seg->vmaddr + seg->vmsize);
 }
 
+uint32_t Macho::get_fileoff(uint64_t vmaddr)
+{
+    load_command* lcd = NULL;
+    uint32_t fileoff = 0;
+    if (is_64) {
+        lcd = (load_command*)(header + 1);
+    } else {
+        lcd = (load_command*)((mach_header_t*)header + 1);
+    }
+    for (int i = 0; i < header->ncmds; i++) {
+        if (is_64) {
+            if (lcd->cmd == LC_SEGMENT_64) {
+                segment_command_64_t* seg_cmd = (segment_command_64_t*)lcd;
+                if(vmaddr >= seg_cmd->vmaddr && vmaddr < seg_cmd->vmaddr + seg_cmd->vmsize) {
+                    fileoff = vmaddr - seg_cmd->vmaddr + seg_cmd->fileoff;
+                    break;
+                }
+            }
+        } else {
+            if (lcd->cmd == LC_SEGMENT) {
+                segment_command_t* seg_cmd = (segment_command_t*)lcd;
+                if(vmaddr >= seg_cmd->vmaddr && vmaddr < seg_cmd->vmaddr + seg_cmd->vmsize) {
+                    fileoff = vmaddr - seg_cmd->vmaddr + seg_cmd->fileoff;
+                    break;
+                }
+            }
+        }
+
+        lcd = (load_command*)((uint64_t)lcd + lcd->cmdsize);
+    }
+
+    return fileoff;
+}
+
 Macho::Macho()
 {
 }

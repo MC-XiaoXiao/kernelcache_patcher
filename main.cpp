@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -29,6 +30,7 @@ const char* plist_get_string(XMLElement* dictElem, const char* keyName);
 uint64_t plist_get_uint64(XMLElement* dictElem, const char* keyName);
 void init_kext_depends(KernelMacho& kernel, Kext* kext);
 void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel);
+uint32_t patch_ios_kernel(KernelMacho& kernel, const char* patch_path);
 void useage();
 
 int main(int argc, char** argv)
@@ -39,6 +41,7 @@ int main(int argc, char** argv)
     char kexts_path[PATH_LENGTH];
     char output_path[PATH_LENGTH];
     char kexts_list_path[PATH_LENGTH];
+    char ikernel_patch_list_path[PATH_LENGTH] = { 0 };
 
 #if DEBUG
     strcpy(your_kernel_path, "./mach.development.bcm2837");
@@ -46,6 +49,7 @@ int main(int argc, char** argv)
     strcpy(symbol_list_path, "./symbols.txt");
     strcpy(kexts_path, "./kexts");
     strcpy(output_path, "./output.kernel");
+    strcpy(ikernel_patch_list_path, "./patchs.txt");
 #else
     if (argc < 6) {
         useage();
@@ -70,6 +74,8 @@ int main(int argc, char** argv)
     i_kernel.format_macho();
     i_kernel.init_symbols();
     format_prelink_info(i_kernel);
+    if (ikernel_patch_list_path[0])
+        assert(patch_ios_kernel(i_kernel, ikernel_patch_list_path) == 0);
 
     std::ifstream symbol_list_fs(symbol_list_path);
 
@@ -162,6 +168,46 @@ int main(int argc, char** argv)
     output_file_fs.close();
 
     printf("Finish!\n");
+
+    return 0;
+}
+
+uint32_t patch_ios_kernel(KernelMacho& kernel, const char* patch_path)
+{
+    std::ifstream patch_file_fs(patch_path);
+    if (!patch_file_fs) {
+        printf("Faild to load kernel patch list file %s!\n", patch_path);
+        return 1;
+    }
+
+    char tmp_line[255];
+    uint64_t dst_addr;
+    uint32_t file_off;
+    segment_command_64_t* exec_seg = (segment_command_64_t*)kernel.find_segment("__TEXT_EXEC");
+
+    while (patch_file_fs.getline(tmp_line, 255)) {
+        if (tmp_line[0] == '*') {
+            // 目标地址
+            sscanf(tmp_line, "*0x%llx:", &dst_addr);
+            file_off = kernel.get_fileoff(dst_addr);
+            if (!file_off) {
+                printf("Faild to get dst addr 0x%lx fileoff\n", dst_addr);
+                return 1;
+            }
+        } else if (tmp_line[0] == '+') {
+            // 补丁内容
+            uint32_t length = strlen(tmp_line);
+            if ((length - 1) % 2 == 0) {
+                uint32_t n = 0;
+                
+                sscanf(tmp_line, "+%lx", &n);
+                //printf("%x\n", *((uint32_t*)((uint64_t)kernel.file_buf + file_off)));
+                *((uint32_t*)((uint64_t)kernel.file_buf + file_off)) = n;
+                file_off += sizeof(uint32_t);
+                //printf("%x\n", n);
+            }
+        }
+    }
 
     return 0;
 }
@@ -800,7 +846,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                                     found_symbol = true;
                                                 }
 
-                                                if(found_symbol)
+                                                if (found_symbol)
                                                     break;
                                             }
                                         }
@@ -840,15 +886,13 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                                 segment_command_64_t* dep_text_exec_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__TEXT_EXEC");
                                                 segment_command_64_t* dep_data_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA");
                                                 segment_command_64_t* dep_data_const_seg = (segment_command_64_t*)kext->depends[j]->exec_macho->find_segment("__DATA_CONST");
-                                                
 
-                                                
                                                 if (addrs[i] >= dep_text_seg->vmaddr && addrs[i] < dep_text_seg->vmaddr + dep_text_seg->vmsize) {
                                                     addrs[i] -= dep_text_seg->vmaddr;
                                                     addrs[i] += new_prelink_text_base + kext->depends[j]->text_off;
                                                     found_symbol = true;
                                                 } else if (addrs[i] >= dep_text_exec_seg->vmaddr && addrs[i] < dep_text_exec_seg->vmaddr + dep_text_exec_seg->vmsize) {
-                                                    if(addrs[i] == 0xFFFFFFF005734A70) {
+                                                    if (addrs[i] == 0xFFFFFFF005734A70) {
                                                         printf("@@@@!!!!!!FFFFFFF005734A70 to %s\n", kext->depends[j]->kext_id);
                                                         printf("Patch: %p\n", addrs[i] - dep_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->depends[j]->text_exec_off);
                                                     }
@@ -865,7 +909,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                                     found_symbol = true;
                                                 }
 
-                                                if(found_symbol) {
+                                                if (found_symbol) {
                                                     break;
                                                 }
                                             }
@@ -1398,5 +1442,5 @@ uint32_t get_filesize(std::ifstream& fd)
 
 void useage()
 {
-    printf("kernelcache_patcher <your kernel> <iOS kernel> <symbol list> <your kexts path> <output filename>\n");
+    printf("kernelcache_patcher <your kernel> <iOS kernel> <symbol list> <your kexts path> <output filename> [iOS kernel patch list]\n");
 }
