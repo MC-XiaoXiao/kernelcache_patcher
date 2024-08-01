@@ -186,7 +186,9 @@ uint32_t patch_ios_kernel(KernelMacho& kernel, const char* patch_path)
     segment_command_64_t* exec_seg = (segment_command_64_t*)kernel.find_segment("__TEXT_EXEC");
 
     while (patch_file_fs.getline(tmp_line, 255)) {
-        if (tmp_line[0] == '*') {
+        if(tmp_line[0] == '#') {
+            continue;
+        }else if (tmp_line[0] == '*') {
             // 目标地址
             sscanf(tmp_line, "*0x%llx:", &dst_addr);
             file_off = kernel.get_fileoff(dst_addr);
@@ -467,10 +469,10 @@ bool find_offs(
                 }
                 this_off = add_imm;
                 find_this_off = true;
-
-                int write_reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
-                this_write_reg = insn[off_index].detail->arm64.operands[write_reg_index].reg;
             }
+
+            int write_reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+            this_write_reg = insn[off_index].detail->arm64.operands[write_reg_index].reg;
         } else if (strstr(insn[off_index].mnemonic, "ldr")) {
             int ldr_off_index = cs_op_index(handle, &insn[off_index], ARM64_OP_MEM, 1);
             uint32_t ldr_off = insn[off_index].detail->arm64.operands[ldr_off_index].mem.disp;
@@ -486,9 +488,11 @@ bool find_offs(
                 find_this_off = true;
 
                 // printf("Reg cound: %d\n", cs_op_count(handle, &insn[off_index], ARM64_OP_REG));
-                int reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
-                this_write_reg = insn[off_index].detail->arm64.operands[reg_index].reg;
+                
             }
+
+            int reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+            this_write_reg = insn[off_index].detail->arm64.operands[reg_index].reg;
         } else if (strstr(insn[off_index].mnemonic, "str")) {
             int str_off_index = cs_op_index(handle, &insn[off_index], ARM64_OP_MEM, 1);
             uint32_t str_off = insn[off_index].detail->arm64.operands[str_off_index].mem.disp;
@@ -514,7 +518,7 @@ bool find_offs(
             }
 
             if (reg == this_write_reg) {
-                // printf("Over: %llx\n", insn[off_index].address);
+                printf("Over: %llx\n", insn[off_index].address);
                 break;
             }
         }
