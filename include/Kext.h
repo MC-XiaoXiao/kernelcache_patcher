@@ -63,6 +63,7 @@ public:
     uint64_t text_off;
     uint64_t text_exec_off;
     uint64_t data_off;
+	uint32_t data_size;
     uint64_t data_const_off;
 
     uint64_t kmod_addr;
