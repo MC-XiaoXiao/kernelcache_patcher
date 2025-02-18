@@ -6,6 +6,11 @@
 #include <vector>
 #include <map>
 
+#define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
+#define SEG_ALIGN 1 << 6
+
+#define IN_SEGMENT_RANGE(x, seg) (seg && ((x) >= (seg)->vmaddr && (x) < (seg)->vmaddr + (seg)->vmsize))
+
 typedef struct mach_header {
 	uint32_t	magic;		/* mach magic number identifier */
 	uint32_t	cputype;	/* cpu specifier */

@@ -6,7 +6,7 @@ include_directories(include)
 include(CTest)
 enable_testing()
 
-add_executable(kernelcache_patcher main.cpp Macho.cpp KernelMacho.cpp KextMacho.cpp Kext.cpp)
+add_executable(kernelcache_patcher main.cpp Macho.cpp KernelMacho.cpp KextMacho.cpp Kext.cpp Patcher.cpp Plist.cpp)
 
 target_link_libraries(kernelcache_patcher PUBLIC plist++-2.0 tinyxml2 capstone keystone)
 
