@@ -1007,6 +1007,8 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                     count = cs_disasm(handle, (const uint8_t*)kext_text_exec_buf_addr, kext_text_exec_seg->filesize, kext_text_exec_seg->vmaddr, 0, &insn);
                     printf("Count: %x\n");
                     // printf("Nedd: %x\n", kext_text_exec_seg->filesize / 4);
+
+                    char new_insn[30];
                     if (count > 0) {
                         for (size_t i = 0; i < count; i++) {
                             if (strstr(insn[i].mnemonic, "adrp")) {
@@ -1055,7 +1057,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                     // printf("off: %llx\n", off);
                                     patch_addr &= ~0xFFF;
 
-                                    char new_insn[15];
                                     sprintf(new_insn, "adrp %s, 0x%llx", write_reg, patch_addr);
                                     uint64_t insn_addr = insn[i].address - kext_text_exec_seg->vmaddr + new_prelink_text_exec_base + kext->text_exec_off;
                                     // printf("%llx\n", insn_addr);
@@ -1269,7 +1270,6 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                 }
             }
         }
-
         // 最后将段复制到内核中
         printf("New kernel filesize: 0x%x\n", new_kernel_size);
         y_kernel.file_buf = (char*)realloc(y_kernel.file_buf, new_kernel_size);
@@ -1279,6 +1279,12 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
         memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_data_const_fileoff), prelink_data_const_buf, prelink_data_const_size);
         memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_data_fileoff), prelink_data_buf, prelink_data_size);
         memcpy((void*)((uint64_t)y_kernel.file_buf + new_prelink_info_fileoff), prelink_info_buf, prelink_info_size);
+
+        free(prelink_text_buf);
+        free(prelink_text_exec_buf);
+        free(prelink_data_const_buf);
+        free(prelink_data_buf);
+        free(prelink_info_buf);
     }
 }
 
