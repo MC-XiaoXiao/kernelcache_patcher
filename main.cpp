@@ -11,8 +11,6 @@
 #include <Patcher.h>
 #include <Plist.h>
 
-#define TEST 0
-
 #define PATH_LENGTH 255
 
 void format_prelink_info(KernelMacho& kernel);
@@ -31,22 +29,6 @@ int main(int argc, char** argv)
     char kexts_list_path[PATH_LENGTH];
     char ikernel_patch_list_path[PATH_LENGTH] = { 0 };
 
-#if TEST && 0
-    strcpy(your_kernel_path, "./mach.development.bcm2837");
-    strcpy(ios_kernel_path, "./kernelcache.release.ipad7.arm64");
-    strcpy(symbol_list_path, "./symbols.txt");
-    strcpy(kexts_path, "./kexts");
-    strcpy(output_path, "./output.kernel");
-    strcpy(ikernel_patch_list_path, "./patchs.txt");
-#else
-#if DEBUG
-    strcpy(your_kernel_path, "./iOS12/mach.development.bcm2837");
-    strcpy(ios_kernel_path, "./iOS12/kernelcache.release.ipad5.out");
-    strcpy(symbol_list_path, "./iOS12/symbols.txt");
-    strcpy(kexts_path, "./iOS12/kexts");
-    strcpy(output_path, "./iOS12/output.kernel");
-    strcpy(ikernel_patch_list_path, "./iOS12/patchs.txt");
-#else
     if (argc < 6) {
         useage();
         exit(0);
@@ -58,8 +40,6 @@ int main(int argc, char** argv)
     strcpy(kexts_path, argv[4]);
     strcpy(output_path, argv[5]);
     strcpy(ikernel_patch_list_path, argv[6]);
-#endif
-#endif
 
     sprintf(kexts_list_path, "%s/kexts.txt", kexts_path);
     std::ifstream kexts_list_fs(kexts_list_path);
