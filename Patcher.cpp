@@ -945,13 +945,18 @@ uint32_t patch_ios_kernel(KernelMacho& kernel, const char* patch_path)
     uint64_t dst_addr;
     uint32_t file_off;
     segment_command_64_t* exec_seg = (segment_command_64_t*)kernel.find_segment("__TEXT_EXEC");
+    uint32_t length;
+    uint32_t value = 0;
 
     while (patch_file_fs.getline(tmp_line, 255)) {
         if (tmp_line[0] == '#') {
             continue;
         } else if (tmp_line[0] == '*') {
             // 目标地址
-            sscanf(tmp_line, "*0x%llx:", &dst_addr);
+            if(sscanf(tmp_line, "*0x%llx:", &dst_addr) <= 0) {
+                return 1;
+            }
+
             file_off = kernel.get_fileoff(dst_addr);
             if (!file_off) {
                 printf("Faild to get dst addr 0x%lx fileoff\n", dst_addr);
@@ -959,13 +964,12 @@ uint32_t patch_ios_kernel(KernelMacho& kernel, const char* patch_path)
             }
         } else if (tmp_line[0] == '+') {
             // 补丁内容
-            uint32_t length = strlen(tmp_line);
+            length = strlen(tmp_line);
             if ((length - 1) % 2 == 0) {
-                uint32_t n = 0;
-
-                sscanf(tmp_line, "+%lx", &n);
+                sscanf(tmp_line, "+%x", &value);
+                // printf("Patching 0x%llx(0x%x)\n", dst_addr, file_off);
                 // printf("%x\n", *((uint32_t*)((uint64_t)kernel.file_buf + file_off)));
-                *((uint32_t*)((uint64_t)kernel.file_buf + file_off)) = n;
+                *((uint32_t*)((uint64_t)kernel.file_buf + file_off)) = value;
                 file_off += sizeof(uint32_t);
                 // printf("%x\n", n);
             }
