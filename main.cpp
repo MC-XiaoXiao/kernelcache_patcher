@@ -27,7 +27,7 @@ int main(int argc, char** argv)
     char kexts_path[PATH_LENGTH];
     char output_path[PATH_LENGTH];
     char kexts_list_path[PATH_LENGTH];
-    char ikernel_patch_list_path[PATH_LENGTH] = { 0 };
+    char ikernel_patch_list_path[PATH_LENGTH];
 
     if (argc < 6) {
         useage();
@@ -45,7 +45,7 @@ int main(int argc, char** argv)
     std::ifstream kexts_list_fs(kexts_list_path);
 
     if (!kexts_list_fs.is_open()) {
-        printf("Cannot open kexts list file!\n");
+        printf("Cannot open kexts list file %s!\n", kexts_list_path);
         exit(1);
     }
 

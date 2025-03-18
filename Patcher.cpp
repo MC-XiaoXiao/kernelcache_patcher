@@ -8,7 +8,6 @@
 #include <Patcher.h>
 #include <Plist.h>
 
-
 // 得到单条指令的立即数
 #pragma mark imp:得到单条指令的立即数
 static uint64_t getSingleIMM(csh handle, const cs_insn* insn)
@@ -81,7 +80,7 @@ static void patch_seg_vmbase(segment_command_64_t* seg, uint64_t vmaddr, uint64_
     }
 }
 
-void patch_seg_base(segment_command_64_t* seg, uint64_t fileoff, uint64_t vmaddr, uint64_t size)
+static void patch_seg_base(segment_command_64_t* seg, uint64_t fileoff, uint64_t vmaddr, uint64_t size)
 {
     patch_seg_vmbase(seg, vmaddr, size);
     seg->fileoff = fileoff;
@@ -93,7 +92,7 @@ void patch_seg_base(segment_command_64_t* seg, uint64_t fileoff, uint64_t vmaddr
 }
 
 
-bool find_offs(
+static bool find_offs(
     csh handle,
     const cs_insn* insn,
     uint64_t start,
@@ -436,7 +435,7 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                                 addrs[i] += new_prelink_data_base + kext->depends[j]->data_off;
                                                 found_symbol = true;
                                             // } else if (addrs[i] >= dep_data_const_seg->vmaddr && addrs[i] < dep_data_const_seg->vmaddr + dep_data_const_seg->vmsize) {
-                                            } else if(IN_SEGMENT_RANGE(addrs[i], dep_data_const_seg)) {
+                                            } else if (IN_SEGMENT_RANGE(addrs[i], dep_data_const_seg)) {
                                                 addrs[i] -= dep_data_const_seg->vmaddr;
                                                 addrs[i] += new_prelink_data_const_base + kext->depends[j]->data_const_off;
                                                 found_symbol = true;
@@ -953,7 +952,7 @@ uint32_t patch_ios_kernel(KernelMacho& kernel, const char* patch_path)
             continue;
         } else if (tmp_line[0] == '*') {
             // 目标地址
-            if(sscanf(tmp_line, "*0x%llx:", &dst_addr) <= 0) {
+            if (sscanf(tmp_line, "*0x%llx:", &dst_addr) <= 0) {
                 return 1;
             }
 
