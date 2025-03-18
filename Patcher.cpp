@@ -1,4 +1,5 @@
 
+#include <set>
 #include <unordered_set>
 
 #include <capstone/capstone.h>
@@ -91,27 +92,42 @@ static void patch_seg_base(segment_command_64_t* seg, uint64_t fileoff, uint64_t
     sect->size = size;
 }
 
-
 static bool find_offs(
     csh handle,
     const cs_insn* insn,
     uint64_t start,
     uint64_t end,
     uint32_t reg,
-    std::vector<int>& indexs,
-    uint32_t& off)
+    std::set<int>& indexs,
+    std::set<int>& jumps, // 记录已跳转的位置
+    uint32_t& off,
+    bool find_first_off = false)
 {
     std::unordered_set<int> used_addr;
-    bool find_first_off = false;
     bool find_this_off = false;
     uint32_t first_off = ~0;
     uint32_t this_off = ~0;
     uint32_t this_write_reg;
     uint32_t this_read_reg;
 
-    for (size_t off_index = start + 1; off_index < end; off_index++) {
+    printf("start: 0x%x(0x%llx), reg %s, off: 0x%x\n", start, insn[start].address, cs_reg_name(handle, reg), off);
+
+    if (find_first_off)
+        first_off = off;
+
+    for (int off_index = start + 1; off_index < end; off_index++) {
         this_write_reg = 0;
         this_read_reg = 0;
+        find_this_off = false;
+        this_off = ~0;
+        if (jumps.find(off_index) != jumps.end() || indexs.find(off_index) != indexs.end()) {
+            printf("Over at 0x%llx\n", insn[off_index].address);
+            break;
+        }
+
+        // 每条语句只检测一次
+        jumps.insert(off_index);
+
         if (cs_insn_group(handle, &insn[off_index], CS_GRP_JUMP)) {
             if (strstr(insn[off_index].mnemonic, "bl")) {
                 if (cs_op_count(handle, &insn[off_index], ARM64_OP_IMM) > 0) {
@@ -127,9 +143,33 @@ static bool find_offs(
                 break;
             } else if (!strcmp(insn[off_index].mnemonic, "br")) {
                 // break;
+} else if (strstr(insn[off_index].mnemonic, "tb")) {
+                continue;
+            } else if (strstr(insn[off_index].mnemonic, "b")) {
+                // printf("0x%llx, %s\n", insn[off_index].address, insn[off_index].mnemonic);
+                uint64_t b_next = getSingleIMM(handle, &insn[off_index]);
+                if (b_next) {
+                    int new_offset = b_next - insn[off_index].address;
+                    new_offset /= 4;
+                    // printf("BNext: 0x%llx, count %d\n", b_next, new_offset);
+                    if (new_offset >= 0) {
+                        int new_start = off_index + new_offset;
+                        if (new_start >= 0 && new_start < end) {
+                            // if (jumps.find(new_start) == jumps.end()) {
+                            // jumps.insert(new_start);
+                            //     jumps.insert(off_index);
+                            find_first_off = find_offs(handle, insn, new_start - 1, end, reg, indexs, jumps, off, find_first_off);
+                            if (find_first_off) {
+                                first_off = off;
+                            }
+                        }
+                    }
+                }
             } else {
                 // printf("%s, 0x%llx\n", insn[off_index].mnemonic, insn[off_index].address);
             }
+
+            continue;
         } else if (!strcmp(insn[off_index].mnemonic, "adrp")) {
             int reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
             if (reg == insn[off_index].detail->arm64.operands[reg_index].reg) {
@@ -150,12 +190,14 @@ static bool find_offs(
             read_tmp = insn[off_index].detail->arm64.operands[read_reg_index].reg;
             write_tmp = insn[off_index].detail->arm64.operands[write_reg_index].reg;
             
-            // if(read_tmp == reg) {
-            //     printf("0x%llx: mov: %s, %s\n", insn[off_index].address, cs_reg_name(handle, write_tmp), cs_reg_name(handle, read_tmp));
-            //     reg = write_tmp;
-            // } else {
-                this_write_reg  = insn[off_index].detail->arm64.operands[write_reg_index].reg;
-            // }
+            if (read_tmp == reg && find_first_off) {
+                printf("0x%llx: mov: %s, %s\n", insn[off_index].address, cs_reg_name(handle, write_tmp), cs_reg_name(handle, read_tmp));
+                this_write_reg = reg;
+                reg = write_tmp;
+            } else {
+                this_write_reg = insn[off_index].detail->arm64.operands[write_reg_index].reg;
+                // printf("0x%llx, Write reg: %s\n", insn[off_index].address, cs_reg_name(handle, this_write_reg));
+            }
             
         } else if (!strcmp(insn[off_index].mnemonic, "add")) {
             int add_imm = getSingleIMM(handle, &insn[off_index]);
@@ -175,6 +217,17 @@ static bool find_offs(
 
             int write_reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
             this_write_reg = insn[off_index].detail->arm64.operands[write_reg_index].reg;
+        } else if (!strcmp(insn[off_index].mnemonic, "sub")) {
+            int write_reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 1);
+            int read_reg_index = cs_op_index(handle, &insn[off_index], ARM64_OP_REG, 2);
+
+            this_write_reg = insn[off_index].detail->arm64.operands[write_reg_index].reg;
+            this_read_reg = insn[off_index].detail->arm64.operands[read_reg_index].reg;
+
+            if (this_read_reg == this_write_reg && this_write_reg == ARM64_REG_SP) { // 遇到函数头或者结束
+                break;
+            }
+
         } else if (strstr(insn[off_index].mnemonic, "ldr")) {
             int ldr_off_index = cs_op_index(handle, &insn[off_index], ARM64_OP_MEM, 1);
             uint32_t ldr_off = insn[off_index].detail->arm64.operands[ldr_off_index].mem.disp;
@@ -212,13 +265,15 @@ static bool find_offs(
 
         if (find_this_off) {
             // 如果偏移量相同就添加进offs中
-            if (first_off == this_off && this_read_reg == reg) {
+            // printf("Debug：firstoff: %x, thisoff: %x, thisreg: %d, reg: %d\n", first_off, this_off, this_read_reg, reg);
+            if (first_off != ~0 && first_off == this_off && this_read_reg == reg) {
                 off = this_off;
                 // printf("Found off: 0x%lx 0x%llx\n", this_off, insn[off_index].address);
-                indexs.push_back(off_index);
+                indexs.insert(off_index);
             }
 
-            if (this_write_reg == reg) {
+            // 检测当前寄存器是否被修改，是的话就停止搜查
+            if (this_write_reg == reg || (this_write_reg + 31 == reg)) {
                 // printf("Over: %llx\n", insn[off_index].address);
                 break;
             }
@@ -670,10 +725,11 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                     uint64_t patch_addr = 0;
 
                                     // 寻找匹配的off
-                                    std::vector<int> off_indexs;
+                                    std::set<int> off_indexs;
+                                    std::set<int> jumps;
                                     uint32_t off = 0;
-                                    // printf("Found next for 0x%llx\n", insn[i].address);
-                                    bool find_off = find_offs(handle, insn, i, count, insn[i].detail->arm64.operands[reg_index].reg, off_indexs, off);
+                                    // printf("Found next for 0x%llx(%s)\n", insn[i].address, kext->kext_id);
+                                    bool find_off = find_offs(handle, insn, i, count, insn[i].detail->arm64.operands[reg_index].reg, off_indexs, jumps, off);
                                     if (!find_off) {
                                         printf("Not found offs for 0x%llx\n", insn[i].address);
                                         off = 0;
@@ -690,15 +746,17 @@ void patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel)
                                         patch_addr += new_prelink_data_base + kext->data_off;
 
                                     // } else if (off + imm >= kext_data_const_seg->vmaddr && off + imm < (kext_data_const_seg->vmaddr + kext_data_const_seg->vmsize)) {
-                                    } else if(IN_SEGMENT_RANGE(off + imm, kext_data_const_seg)) {
+                                    } else if (IN_SEGMENT_RANGE(off + imm, kext_data_const_seg)) {
                                         patch_addr = off + imm - kext_data_const_seg->vmaddr;
                                         patch_addr += new_prelink_data_const_base + kext->data_const_off;
                                     } else {
                                         continue;
                                     }
+
+                                    // printf("old off: %llx\n", off);
                                     off = patch_addr & 0xFFF;
                                     // printf("Addr: %llx\n", patch_addr);
-                                    // printf("off: %llx\n", off);
+                                    // printf("New off: %llx\n", off);
                                     patch_addr &= ~0xFFF;
 
                                     sprintf(new_insn, "adrp %s, 0x%llx", write_reg, patch_addr);
