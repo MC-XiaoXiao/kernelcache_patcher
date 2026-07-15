@@ -35,6 +35,15 @@ struct CppAnalyzerStats {
     size_t injected_symbols = 0;
 };
 
+namespace cpp_analyzer_detail {
+
+// Validates the single-constructor layout emitted by
+// OSDefineMetaClassAndAbstractStructors and returns its destructor stubs.
+bool find_abstract_structor_layout(const Macho& image, uint64_t constructor,
+    uint64_t& d2, uint64_t& d1, uint64_t& d0);
+
+} // namespace cpp_analyzer_detail
+
 // Recovers OSMetaClass registrations and instance vtables from a stripped
 // arm64 kernelcache. A same-version unstripped image is used only as a symbol
 // and vtable-slot template; all recovered addresses belong to the stripped

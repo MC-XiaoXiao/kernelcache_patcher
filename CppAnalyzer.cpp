@@ -269,6 +269,13 @@ static bool is_unconditional_branch(uint32_t instruction)
     return (instruction & 0x7c000000U) == 0x14000000U;
 }
 
+static bool is_breakpoint(uint32_t instruction)
+{
+    // BRK #imm16.  Abstract OSMetaClass structors use BRK stubs for D1/D0
+    // because instances of the abstract class cannot be destroyed directly.
+    return (instruction & 0xffe0001fU) == 0xd4200000U;
+}
+
 static uint64_t find_function_return(const Macho& image, uint64_t start, size_t max_instructions = 96)
 {
     for (size_t index = 0; index < max_instructions; ++index) {
@@ -365,6 +372,30 @@ static std::vector<const Symbol*> symbols_at(const Macho& image, uint64_t addres
 }
 
 } // namespace
+
+bool cpp_analyzer_detail::find_abstract_structor_layout(const Macho& image,
+    uint64_t constructor, uint64_t& d2, uint64_t& d1, uint64_t& d0)
+{
+    d2 = d1 = d0 = 0;
+    uint64_t constructor_end = find_function_return(image, constructor);
+    if (!constructor_end)
+        return false;
+
+    d2 = constructor_end + 4;
+    d1 = d2 + 4;
+    d0 = d1 + 4;
+    uint32_t d2_instruction = 0, d1_instruction = 0, d0_instruction = 0;
+    if (!image.read_u32_vm(d2, d2_instruction)
+        || !image.read_u32_vm(d1, d1_instruction)
+        || !image.read_u32_vm(d0, d0_instruction)
+        || !is_unconditional_branch(d2_instruction)
+        || !is_breakpoint(d1_instruction)
+        || !is_breakpoint(d0_instruction)) {
+        d2 = d1 = d0 = 0;
+        return false;
+    }
+    return true;
+}
 
 CppClassAnalyzer::CppClassAnalyzer(Macho& source, const Macho& symbol_template)
     : source_(source)
@@ -497,11 +528,11 @@ CppAnalyzerStats CppClassAnalyzer::recover()
 
 
     // Find all functions that materialize the instance vtable address point.
-    // The macro-generated C2 and C1 constructors are adjacent, followed by
-    // one-instruction D2 and D1 tail thunks.  This layout works for both old
-    // iOS (constructors precede MetaClassC2) and newer builds (the opposite
-    // object-file ordering), and the vtable write plus B/B validation avoids
-    // relying on guessed function sizes.
+    // Concrete macro-generated classes normally have adjacent C2 and C1
+    // constructors followed by D2/D1/D0.  Abstract OSMetaClass classes emit
+    // only C2, followed by a D2 tail branch and BRK stubs for D1/D0.  Validate
+    // both layouts so an abstract base constructor can be recovered without a
+    // manual symbol table.
     std::unordered_set<uint64_t> vtable_address_points;
     for (const RecoveredClass& recovered : classes_) {
         if (recovered.vtable)
@@ -515,6 +546,27 @@ CppAnalyzerStats CppClassAnalyzer::recover()
         if (found_candidates == materializations.end())
             continue;
         const std::vector<uint64_t>& candidates = found_candidates->second;
+        std::string type = itanium_type(recovered.name);
+
+        if (candidates.size() == 1) {
+            uint64_t c2 = candidates.front();
+            uint64_t d2 = 0, d1 = 0, d0 = 0;
+            if (cpp_analyzer_detail::find_abstract_structor_layout(source_, c2, d2, d1, d0)) {
+                for (const auto& symbol : std::array<std::pair<uint64_t, std::string>, 4> {{
+                         { c2, "__ZN" + type + "C2EPK11OSMetaClass" },
+                         { d2, "__ZN" + type + "D2Ev" },
+                         { d1, "__ZN" + type + "D1Ev" },
+                         { d0, "__ZN" + type + "D0Ev" },
+                     }}) {
+                    size_t before = stats.injected_symbols;
+                    add_symbol(symbol.first, symbol.second, stats);
+                    if (stats.injected_symbols != before)
+                        ++stats.structural_symbols;
+                }
+                continue;
+            }
+        }
+
         for (size_t index = 0; index + 1 < candidates.size(); ++index) {
             uint64_t c2 = candidates[index];
             uint64_t c2_end = find_function_return(source_, c2);
@@ -529,7 +581,6 @@ CppAnalyzerStats CppClassAnalyzer::recover()
                 || !is_unconditional_branch(d2_instruction)
                 || !is_unconditional_branch(d1_instruction))
                 continue;
-            std::string type = itanium_type(recovered.name);
             for (const auto& symbol : std::array<std::pair<uint64_t, std::string>, 5> {{
                      { c2, "__ZN" + type + "C2EPK11OSMetaClass" },
                      { c1, "__ZN" + type + "C1EPK11OSMetaClass" },
@@ -696,6 +747,7 @@ CppAnalyzerStats CppClassAnalyzer::recover()
             if (!symbol || !symbol->symbol_name || !symbol->symbol_addr
                 || !required_symbols.count(symbol->symbol_name))
                 continue;
+            const std::string symbol_name = symbol->symbol_name;
             for (RecoveredClass& recovered : classes_) {
                 if (!recovered.vtable || !simple_class_name(recovered.name))
                     continue;
@@ -711,12 +763,36 @@ CppAnalyzerStats CppClassAnalyzer::recover()
                     auto reference_candidates = reference_materializations.find(reference_vtable->second + 16);
                     if (reference_candidates != reference_materializations.end()) {
                         const std::vector<uint64_t>& candidates = reference_candidates->second;
+                        const std::vector<uint64_t>& source_list = source_candidates->second;
+
+                        // Constructors are themselves vtable materializers.  In
+                        // particular, OSDefineMetaClassAndAbstractStructors emits
+                        // one C2 and no C1.  Map a named reference constructor
+                        // directly to the corresponding stripped candidate when
+                        // both images have the same unambiguous layout.
+                        std::string type = itanium_type(recovered.name);
+                        std::string c1 = "__ZN" + type + "C1EPK11OSMetaClass";
+                        std::string c2 = "__ZN" + type + "C2EPK11OSMetaClass";
+                        if (source_list.size() == candidates.size()
+                            && (symbol_name == c1 || symbol_name == c2)) {
+                            auto candidate = std::find(candidates.begin(), candidates.end(), symbol->symbol_addr);
+                            if (candidate != candidates.end()) {
+                                size_t index = static_cast<size_t>(candidate - candidates.begin());
+                                size_t before = stats.injected_symbols;
+                                add_symbol(source_list[index], symbol_name, stats);
+                                if (stats.injected_symbols != before)
+                                    ++stats.reference_symbols;
+                            }
+                        }
+
+                        if (source_.find_symbol_by_name(symbol_name))
+                            break;
+
                         for (size_t index = 0; index < candidates.size(); ++index) {
                             uint64_t candidate_end = find_function_return(*reference, candidates[index]);
                             if (!candidate_end || candidate_end + 4 != symbol->symbol_addr)
                                 continue;
                             size_t reverse_index = candidates.size() - 1 - index;
-                            const std::vector<uint64_t>& source_list = source_candidates->second;
                             if (reverse_index >= source_list.size())
                                 break;
                             uint64_t source_function = source_list[source_list.size() - 1 - reverse_index];

@@ -10,6 +10,7 @@
 
 #include <Patcher.h>
 #include <Plist.h>
+#include <StructorRebase.h>
 
 static bool resolve_kernel_reference(uint64_t source_address, KernelMacho& source_kernel,
     KernelMacho& target_kernel, const LinkResolver* resolver, uint64_t& target_address)
@@ -52,6 +53,44 @@ static bool rebase_dependency_reference(Kext* kext, uint64_t source_address,
         }
     }
     return false;
+}
+
+static bool rebase_structor_section(Kext* kext, const section_64_t* section,
+    const char* section_name, const segment_command_64_t* data_const_segment,
+    const segment_command_64_t* text_exec_segment, void* prelink_data_const_buf,
+    uint64_t new_prelink_text_exec_base)
+{
+    if (!section)
+        return true;
+    if (!kext || !data_const_segment || !text_exec_segment || !prelink_data_const_buf) {
+        printf("Cannot rebase %s for %s: required segment is missing\n", section_name,
+            kext && kext->kext_id ? kext->kext_id : "<unknown>");
+        return false;
+    }
+    if (section->addr < data_const_segment->vmaddr
+        || section->addr - data_const_segment->vmaddr > data_const_segment->filesize
+        || section->size > data_const_segment->filesize - (section->addr - data_const_segment->vmaddr)
+        || section->size % sizeof(uint64_t)) {
+        printf("Cannot rebase %s for %s: malformed section range\n", section_name,
+            kext->kext_id ? kext->kext_id : "<unknown>");
+        return false;
+    }
+
+    auto* entries = reinterpret_cast<uint64_t*>(
+        reinterpret_cast<uint64_t>(prelink_data_const_buf) + kext->data_const_off
+        + section->addr - data_const_segment->vmaddr);
+    size_t invalid_index = 0;
+    if (!patcher_detail::rebase_structor_entries(entries,
+            section->size / sizeof(uint64_t), text_exec_segment->vmaddr,
+            text_exec_segment->vmsize,
+            new_prelink_text_exec_base + kext->text_exec_off, &invalid_index)) {
+        printf("Cannot rebase %s[%zu] for %s: address 0x%" PRIx64
+               " is outside __TEXT_EXEC\n",
+            section_name, invalid_index, kext->kext_id ? kext->kext_id : "<unknown>",
+            entries[invalid_index]);
+        return false;
+    }
+    return true;
 }
 
 // 得到单条指令的立即数
@@ -555,28 +594,21 @@ size_t patch_kext_to_kernel(KernelMacho& y_kernel, KernelMacho& i_kernel, const 
                     }
                 }
 
-                // 修复data const段的地址
-                // 修复mod_init_func和mod_term_func
-
+                // Rebase constructor and destructor tables independently.
+                // Init-only kexts are common; requiring a term section leaves
+                // raw addresses such as 0x43f0 in __mod_init_func.
                 if (kext_data_const_seg) {
                     section_64_t* init_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_init_func");
                     section_64_t* term_sect = (section_64_t*)kext->exec_macho->find_section("__DATA_CONST", "__mod_term_func");
-                    if (init_sect && term_sect && kext_text_exec_seg) {
-                        uint64_t* mod_addr = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + init_sect->addr - kext_data_const_seg->vmaddr);
-                        for (size_t i = 0; i < init_sect->size / sizeof(uint64_t); i++) {
-                            *mod_addr = *mod_addr - kext_text_exec_seg->vmaddr;
-                            *mod_addr = *mod_addr + kext->text_exec_off + new_prelink_text_exec_base;
-
-                            mod_addr++;
-                        }
-
-                        mod_addr = (uint64_t*)((uint64_t)prelink_data_const_buf + kext->data_const_off + term_sect->addr - kext_data_const_seg->vmaddr);
-                        for (size_t i = 0; i < term_sect->size / sizeof(uint64_t); i++) {
-                            *mod_addr = *mod_addr - kext_text_exec_seg->vmaddr;
-                            *mod_addr = *mod_addr + kext->text_exec_off + new_prelink_text_exec_base;
-
-                            mod_addr++;
-                        }
+                    if (!rebase_structor_section(kext, init_sect, "__mod_init_func",
+                            kext_data_const_seg, kext_text_exec_seg,
+                            prelink_data_const_buf, new_prelink_text_exec_base)
+                        || !rebase_structor_section(kext, term_sect, "__mod_term_func",
+                            kext_data_const_seg, kext_text_exec_seg,
+                            prelink_data_const_buf, new_prelink_text_exec_base)) {
+                        ks_close(ks);
+                        cs_close(&handle);
+                        return SIZE_MAX;
                     }
 
                     if (kext_text_exec_seg)
