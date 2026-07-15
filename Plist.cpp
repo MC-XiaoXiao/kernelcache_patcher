@@ -1,5 +1,6 @@
 
 #include <Plist.h>
+#include <cinttypes>
 
 XMLElement* new_plist_elem(XMLDocument* doc, XMLElement* ins_ele, const char* type_name, const char* key_name)
 {
@@ -19,22 +20,13 @@ void plist_add_int(XMLDocument* doc, XMLElement* elem, const char* name, uint64_
 {
     XMLElement* valueElem;
     char tmp_str[20];
-    char tmp_format[20];
-    // if (size == 64)
-    //     sprintf(tmp_format, "0x%%%dllx", size / 4);
-    // else if (size == 32)
-    //     sprintf(tmp_format, "0x%%%dx", size / 4);
-    sprintf(tmp_format, "0xllx");
-    // printf("%s\n", tmp_format);
-
-    sprintf(tmp_str, "0x%llx", value);
-    // printf("%s\n", tmp_str);
+    snprintf(tmp_str, sizeof(tmp_str), "0x%" PRIx64, value);
 
     if ((valueElem = plist_get_item(elem, name))) {
         valueElem->SetText(tmp_str);
     } else {
         XMLElement* new_elem = new_plist_elem(doc, elem, "integer", name);
-        new_elem->SetAttribute("size", 64);
+        new_elem->SetAttribute("size", size);
         new_elem->SetText(tmp_str);
     }
 }
@@ -61,7 +53,6 @@ XMLElement* plist_get_item(XMLElement* elm, const char* keyName)
 
 bool plist_has_item(XMLElement* dictElem, const char* keyName)
 {
-    uint64_t result = 0;
     if (!dictElem)
         return 0;
 
@@ -140,12 +131,14 @@ char* make_prelink_info(KernelMacho& kernel, uint64_t& info_size)
     prelink_info_doc->Print(&streamer);
 
     // printf("%s", streamer.CStr());
-    info_size = streamer.CStrSize();
+    const size_t xml_size = streamer.CStrSize();
+    info_size = xml_size;
     info_size = ALIGN_UP(info_size, 1 << 12);
-    printf("Preinfo size: %x\n", info_size);
-    result = (char*)malloc(info_size);
+    printf("Preinfo size: 0x%" PRIx64 "\n", info_size);
+    result = (char*)calloc(info_size, 1);
     const char* tmp = streamer.CStr();
-    memcpy((void*)result, tmp, info_size);
+    memcpy((void*)result, tmp, xml_size);
+    delete prelink_info_doc;
     // printf("%s\n", (char *)result);
     return result;
 }

@@ -54,19 +54,19 @@ private:
     /* data */
 public:
     XMLDocument kextInfoDoc;
-    XMLElement *kextInfoElement;
-    KextMacho *exec_macho;
+    XMLElement *kextInfoElement = nullptr;
+    KextMacho *exec_macho = nullptr;
     std::vector<Kext *> depends;
-    const char *kext_id;
-    bool is_from_file;
+    const char *kext_id = nullptr;
+    bool is_from_file = false;
 
-    uint64_t text_off;
-    uint64_t text_exec_off;
-    uint64_t data_off;
-	uint32_t data_size;
-    uint64_t data_const_off;
+    uint64_t text_off = 0;
+    uint64_t text_exec_off = 0;
+    uint64_t data_off = 0;
+	uint32_t data_size = 0;
+    uint64_t data_const_off = 0;
 
-    uint64_t kmod_addr;
+    uint64_t kmod_addr = 0;
 
     Kext(/* args */);
     ~Kext();

@@ -1,15 +1,20 @@
 #include <assert.h>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
+#include <CppAnalyzer.h>
 #include <KernelMacho.h>
 #include <KextMacho.h>
 #include <Macho.h>
 #include <Patcher.h>
 #include <Plist.h>
+#include <Resolver.h>
 
 #define PATH_LENGTH 255
 
@@ -19,33 +24,128 @@ uint32_t get_filesize(std::ifstream& fd);
 void init_kext_depends(KernelMacho& kernel, Kext* kext);
 void useage();
 
+static bool add_symbol_to_containing_kext(const RecoveredSymbol& recovered, const std::vector<Kext*>& kexts)
+{
+    for (Kext* kext : kexts) {
+        if (!kext || kext->is_from_file || !kext->exec_macho)
+            continue;
+        for (const char* segment_name : { "__TEXT", "__TEXT_EXEC", "__DATA", "__DATA_CONST" }) {
+            auto* segment = static_cast<segment_command_64_t*>(kext->exec_macho->find_segment(segment_name));
+            if (kext->exec_macho->addr_in_segment(segment, recovered.address)) {
+                kext->exec_macho->add_symbol(recovered.address, recovered.name, true);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static std::filesystem::path find_reference_root()
+{
+    if (const char* configured = getenv("KERNELCACHE_PATCHER_REFERENCE_DIR")) {
+        std::filesystem::path path(configured);
+        if (std::filesystem::is_directory(path))
+            return path;
+    }
+    std::filesystem::path current = std::filesystem::current_path();
+    for (unsigned depth = 0; depth < 8; ++depth) {
+        std::filesystem::path candidate = current / "kexts" / "reference";
+        if (std::filesystem::is_directory(candidate))
+            return candidate;
+        if (!current.has_parent_path() || current == current.parent_path())
+            break;
+        current = current.parent_path();
+    }
+    return {};
+}
+
+static int analyze_resolver(int argc, char** argv)
+{
+    if (argc < 4) {
+        printf("kernelcache_patcher analyze <local-unstripped-kernel> <release-kernel> [release-symbols.json]\n");
+        return 1;
+    }
+
+    KernelMacho target(argv[2]);
+    KernelMacho source(argv[3]);
+    target.format_macho();
+    source.format_macho();
+    target.init_symbols();
+    source.init_symbols();
+
+    bool details = false;
+    std::string symbols_path = std::string(argv[3]) + ".symbols.json";
+    for (int i = 4; i < argc; ++i) {
+        if (!strcmp(argv[i], "--details"))
+            details = true;
+        else
+            symbols_path = argv[i];
+    }
+    size_t loaded = source.load_symbols_json(symbols_path.c_str());
+    printf("Loaded %zu release symbols from %s\n", loaded, symbols_path.c_str());
+
+    CppClassAnalyzer cpp_analyzer(source, target);
+    CppAnalyzerStats cpp_stats = cpp_analyzer.recover();
+    printf("Stripped C++ analyzer: %zu registrations, %zu instance vtables, %zu named slots, %zu symbols\n",
+        cpp_stats.registrations, cpp_stats.classes_with_vtables, cpp_stats.named_virtual_slots,
+        cpp_stats.injected_symbols);
+
+    LinkResolver resolver(source, target);
+    ResolverStats stats = resolver.build();
+    printf("Resolver: %zu named symbols, %zu vtables (%zu rejected), %zu virtual slots, %zu ambiguous addresses\n",
+        stats.named_symbols, stats.matched_vtables, stats.rejected_vtables, stats.matched_vtable_slots,
+        stats.ambiguous_addresses);
+    if (details) {
+        for (const RecoveredClass& recovered : cpp_analyzer.classes()) {
+            printf("class %s : %s, meta=0x%llx, registration=0x%llx, vtable=0x%llx, slots=%zu\n",
+                recovered.name.c_str(), recovered.super_name.empty() ? "<unknown>" : recovered.super_name.c_str(),
+                static_cast<unsigned long long>(recovered.meta_object),
+                static_cast<unsigned long long>(recovered.registration_call),
+                static_cast<unsigned long long>(recovered.vtable), recovered.slots.size());
+            if (recovered.registration_calls.size() > 1) {
+                printf("  registration calls:");
+                for (uint64_t call : recovered.registration_calls)
+                    printf(" 0x%llx", static_cast<unsigned long long>(call));
+                printf("\n");
+            }
+        }
+        for (const VtableMatch& vtable : resolver.vtables()) {
+            printf("%s: 0x%llx -> 0x%llx (%zu slots)\n", vtable.name.c_str(),
+                static_cast<unsigned long long>(vtable.source_address),
+                static_cast<unsigned long long>(vtable.target_address), vtable.target_slots.size());
+            for (size_t slot = 0; slot < vtable.target_slots.size(); ++slot) {
+                Symbol* symbol = target.find_symbol_by_addr(vtable.target_slots[slot]);
+                printf("  [%3zu] 0x%llx %s\n", slot,
+                    static_cast<unsigned long long>(vtable.target_slots[slot]),
+                    symbol && symbol->symbol_name ? symbol->symbol_name : "<unnamed>");
+            }
+        }
+    }
+    return stats.matched_vtables ? 0 : 2;
+}
+
 int main(int argc, char** argv)
 {
-    char your_kernel_path[PATH_LENGTH];
-    char ios_kernel_path[PATH_LENGTH];
-    char symbol_list_path[PATH_LENGTH];
-    char kexts_path[PATH_LENGTH];
-    char output_path[PATH_LENGTH];
-    char kexts_list_path[PATH_LENGTH];
-    char ikernel_patch_list_path[PATH_LENGTH];
+    if (argc > 1 && !strcmp(argv[1], "analyze"))
+        return analyze_resolver(argc, argv);
 
     if (argc < 6) {
         useage();
         exit(0);
     }
 
-    strcpy(your_kernel_path, argv[1]);
-    strcpy(ios_kernel_path, argv[2]);
-    strcpy(symbol_list_path, argv[3]);
-    strcpy(kexts_path, argv[4]);
-    strcpy(output_path, argv[5]);
-    strcpy(ikernel_patch_list_path, argv[6]);
+    const char* your_kernel_path = argv[1];
+    const char* ios_kernel_path = argv[2];
+    const char* symbol_list_path = argv[3];
+    const char* kexts_path = argv[4];
+    const char* output_path = argv[5];
+    const char* ikernel_patch_list_path = argc > 6 ? argv[6] : nullptr;
 
-    sprintf(kexts_list_path, "%s/kexts.txt", kexts_path);
+    std::string kexts_list_path = std::string(kexts_path) + "/kexts.txt";
     std::ifstream kexts_list_fs(kexts_list_path);
 
     if (!kexts_list_fs.is_open()) {
-        printf("Cannot open kexts list file %s!\n", kexts_list_path);
+        printf("Cannot open kexts list file %s!\n", kexts_list_path.c_str());
         exit(1);
     }
 
@@ -57,46 +157,51 @@ int main(int argc, char** argv)
 
     i_kernel.format_macho();
     i_kernel.init_symbols();
+    std::string automatic_symbols_path = std::string(ios_kernel_path) + ".symbols.json";
+    size_t automatic_symbols = strcmp(symbol_list_path, "-")
+        ? i_kernel.load_symbols_json(automatic_symbols_path.c_str()) : 0;
+    if (automatic_symbols)
+        printf("Automatically loaded %zu release symbols from %s\n", automatic_symbols, automatic_symbols_path.c_str());
     format_prelink_info(i_kernel);
-    if (ikernel_patch_list_path[0])
+    if (ikernel_patch_list_path && ikernel_patch_list_path[0])
         assert(patch_ios_kernel(i_kernel, ikernel_patch_list_path) == 0);
 
-    std::ifstream symbol_list_fs(symbol_list_path);
-
-    if (!symbol_list_fs.is_open()) {
-        printf("Cannot open iOS kernel symbol list file!\n");
-        exit(1);
+    std::ifstream symbol_list_fs;
+    if (strcmp(symbol_list_path, "auto") && strcmp(symbol_list_path, "-")) {
+        symbol_list_fs.open(symbol_list_path);
+        if (!symbol_list_fs.is_open()) {
+            printf("Cannot open optional iOS kernel symbol list file %s!\n", symbol_list_path);
+            exit(1);
+        }
     }
 
-    std::vector<const char*> kext_paths;
-    char kext_path[PATH_LENGTH];
-    while (kexts_list_fs.getline(kext_path, PATH_LENGTH)) {
-        if (kext_path[0] == '#' || kext_path[0] == ' ')
+    std::vector<std::string> kext_paths;
+    std::string kext_path;
+    while (std::getline(kexts_list_fs, kext_path)) {
+        if (kext_path.empty() || kext_path[0] == '#' || kext_path[0] == ' ')
             continue;
-        char* tmp_kext_path = (char*)malloc(strlen(kext_path) + 1);
-        memset(tmp_kext_path, 0, strlen(kext_path));
-        strcpy(tmp_kext_path, kext_path);
-        kext_paths.push_back(tmp_kext_path);
+        if (!kext_path.empty() && kext_path.back() == '\r')
+            kext_path.pop_back();
+        kext_paths.push_back(kext_path);
     }
 
     printf("Will load %ld kexts from list\n", kext_paths.size());
     for (size_t i = 0; i < kext_paths.size(); i++) {
-        char kext_dir[PATH_LENGTH];
-        sprintf(kext_dir, "%s/%s", kexts_path, kext_paths[i]);
+        std::string kext_dir = std::string(kexts_path) + "/" + kext_paths[i];
 
-        Kext* kext = load_kext_from_file(kext_dir);
+        Kext* kext = load_kext_from_file(kext_dir.c_str());
         if (kext) {
             // Kext 在文件夹中
             // printf("ID: %s\n", kext->kext_id);
             // y_kernel.kexts[kext_ID] = kext;
             y_kernel.kexts.push_back(kext);
-        } else if ((kext = i_kernel.find_kext(kext_paths[i])) != NULL) {
+        } else if ((kext = i_kernel.find_kext(kext_paths[i].c_str())) != NULL) {
             // Kext 在Kernelcache中
 
             // printf("ID: %s\n", kext->kext_id);
             y_kernel.kexts.push_back(kext);
         } else {
-            printf("Not found kext %s\n", kext_paths[i]);
+            printf("Not found kext %s\n", kext_paths[i].c_str());
             exit(1);
         }
     }
@@ -111,18 +216,16 @@ int main(int argc, char** argv)
 
     char tmp_symbol[255];
     while (symbol_list_fs.getline(tmp_symbol, 255)) {
-        if (kext_path[0] == '#' || kext_path[0] == ' ')
+        if (tmp_symbol[0] == '#' || tmp_symbol[0] == ' ' || tmp_symbol[0] == '\0')
             continue;
-        uint64_t addr = 0;
-        char* symbol_name = (char*)malloc(100);
-        // printf("%s\n", tmp_symbol);
-        sscanf(tmp_symbol, "%lx,%s", &addr, symbol_name);
-        Symbol* symbol = new Symbol();
-        symbol->symbol_addr = addr;
-        symbol->symbol_name = symbol_name;
-        // i_kernel.symbol_addr_map[addr] = symbol;
-        // i_kernel.symbol_list.push_back(symbol);
-        // i_kernel.symbol_name_map[symbol_name] = symbol;
+        unsigned long long parsed_addr = 0;
+        char symbol_name[192] = {};
+        if (sscanf(tmp_symbol, "%llx,%191s", &parsed_addr, symbol_name) != 2) {
+            printf("Ignoring malformed symbol line: %s\n", tmp_symbol);
+            continue;
+        }
+        uint64_t addr = static_cast<uint64_t>(parsed_addr);
+        i_kernel.add_symbol(addr, symbol_name, true);
 
         for (auto kext : y_kernel.kexts) {
             if (!kext->is_from_file) {
@@ -135,9 +238,7 @@ int main(int argc, char** argv)
                         || (IN_SEGMENT_RANGE(addr, kext_text_const_seg))
                         || (IN_SEGMENT_RANGE(addr, kext_data_seg))
                         || (IN_SEGMENT_RANGE(addr, kext_data_const_seg))) {
-                        kext->exec_macho->symbol_addr_map[addr] = symbol;
-                        kext->exec_macho->symbol_list.push_back(symbol);
-                        kext->exec_macho->symbol_name_map[symbol_name] = symbol;
+                        kext->exec_macho->add_symbol(addr, symbol_name, true);
                         break;
                     }
                 }
@@ -145,7 +246,65 @@ int main(int argc, char** argv)
         }
     }
 
-    patch_kext_to_kernel(y_kernel, i_kernel);
+    CppClassAnalyzer cpp_analyzer(i_kernel, y_kernel);
+    for (Kext* kext : y_kernel.kexts) {
+        if (kext && kext->is_from_file && kext->exec_macho)
+            cpp_analyzer.add_kext_template(*kext->exec_macho);
+    }
+    std::vector<std::unique_ptr<Macho>> reference_machos;
+    std::filesystem::path reference_root = find_reference_root();
+    if (!reference_root.empty()) {
+        std::unordered_set<std::string> loaded_reference_paths;
+        for (Kext* kext : y_kernel.kexts) {
+            if (!kext || kext->is_from_file || !kext->kext_id)
+                continue;
+            std::string identifier(kext->kext_id);
+            size_t dot = identifier.find_last_of('.');
+            std::string binary = dot == std::string::npos ? identifier : identifier.substr(dot + 1);
+            std::filesystem::path path = reference_root / (binary + ".kext") / binary;
+            if (!std::filesystem::is_regular_file(path) || !loaded_reference_paths.insert(path.string()).second)
+                continue;
+            auto reference = std::make_unique<Macho>(path.c_str());
+            reference->format_macho();
+            if (!reference->header)
+                continue;
+            reference->init_symbols();
+            cpp_analyzer.add_symbol_reference(*reference);
+            reference_machos.push_back(std::move(reference));
+        }
+        if (!reference_machos.empty())
+            printf("Loaded %zu unstripped Kext structure references from %s\n",
+                reference_machos.size(), reference_root.c_str());
+    }
+    CppAnalyzerStats cpp_stats = cpp_analyzer.recover();
+    size_t routed_symbols = 0;
+    for (const RecoveredSymbol& recovered : cpp_analyzer.symbols()) {
+        if (add_symbol_to_containing_kext(recovered, y_kernel.kexts))
+            ++routed_symbols;
+    }
+    printf("Stripped C++ analyzer: %zu registrations, %zu instance vtables, %zu named slots, "
+           "%zu Kext-template slots, %zu structural symbols, %zu reference symbols, "
+           "%zu symbols (%zu routed to selected Kexts)\n",
+        cpp_stats.registrations, cpp_stats.classes_with_vtables, cpp_stats.named_virtual_slots,
+        cpp_stats.kext_template_slots, cpp_stats.structural_symbols, cpp_stats.reference_symbols,
+        cpp_stats.injected_symbols, routed_symbols);
+
+    LinkResolver resolver(i_kernel, y_kernel);
+    ResolverStats resolver_stats = resolver.build();
+    printf("Automatic resolver: %zu named symbols, %zu vtables (%zu rejected), %zu virtual slots (%zu ambiguous)\n",
+        resolver_stats.named_symbols, resolver_stats.matched_vtables, resolver_stats.rejected_vtables,
+        resolver_stats.matched_vtable_slots, resolver_stats.ambiguous_addresses);
+
+    size_t unresolved_externals = patch_kext_to_kernel(y_kernel, i_kernel, &resolver);
+    if (unresolved_externals == SIZE_MAX) {
+        printf("Kernelcache patching failed before completion; output was not written.\n");
+        return 2;
+    }
+    if (unresolved_externals) {
+        printf("Kernelcache patching failed with %zu unresolved external relocation(s); output was not written.\n",
+            unresolved_externals);
+        return 3;
+    }
 
     std::ofstream output_file_fs(output_path, std::ios::binary);
     output_file_fs.write(y_kernel.file_buf, y_kernel.file_size);
@@ -218,7 +377,6 @@ void format_prelink_info(KernelMacho& kernel)
             XMLElement* kextNode = rootArray->FirstChildElement("dict");
             printf("iOS kernelcache has %d kexts\n", rootArray->ChildElementCount());
 
-            const char* kext_id_list[1000];
             format_info_ids(rootArray);
 
             while (kextNode) {
@@ -232,10 +390,13 @@ void format_prelink_info(KernelMacho& kernel)
                     uint64_t kext_fileoff = (uint64_t)kernel.file_buf + kext_vmaddr - prelink_text_base + prelink_text->fileoff;
                     // printf("off: 0x%016x\n", kext_vmaddr - prelink_text_base + prelink_text->fileoff);
 
-                    KextMacho* kext_macho = new KextMacho((char*)kext_fileoff, 0);
+                    uint64_t kext_size = plist_get_uint64(kextNode, "_PrelinkExecutableSize");
+                    if (!kext_size && kext_vmaddr >= prelink_text_base
+                        && kext_vmaddr - prelink_text_base < prelink_text->filesize)
+                        kext_size = prelink_text->filesize - (kext_vmaddr - prelink_text_base);
+                    KextMacho* kext_macho = new KextMacho((char*)kext_fileoff, static_cast<uint32_t>(kext_size));
                     kext_macho->format_macho();
                     kext->exec_macho = kext_macho;
-                    kext->exec_macho->file_size = plist_get_uint64(kextNode, "_PrelinkExecutableSize");
                     kext->kmod_addr = plist_get_uint64(kextNode, "_PrelinkKmodInfo");
                 } else if (plist_has_item(kextNode, "ModuleIndex")) {
                     kext_vmaddr = plist_get_uint64(kextNode, "ModuleIndex");
@@ -248,10 +409,10 @@ void format_prelink_info(KernelMacho& kernel)
                     }
 
                     uint64_t kext_fileoff = (uint64_t)kernel.file_buf + kext_start - kenrel_exec_seg->vmaddr + kenrel_exec_seg->fileoff;
-                    KextMacho* kext_macho = new KextMacho((char*)kext_fileoff, 0);
+                    uint64_t kext_size = kext_end >= kext_start ? kext_end - kext_start : 0;
+                    KextMacho* kext_macho = new KextMacho((char*)kext_fileoff, static_cast<uint32_t>(kext_size));
                     kext_macho->format_macho();
                     kext->exec_macho = kext_macho;
-                    kext->exec_macho->file_size = kext_start - kext_end;
                     kext->kmod_addr = ((uintptr_t*)((uint64_t)kernel.file_buf + pre_info_kmod_infos->addr - pre_info_seg->vmaddr + pre_info_seg->fileoff))[kext_vmaddr];
                     uint64_t kmod_end = ((uintptr_t*)((uint64_t)kernel.file_buf + pre_info_kmod_infos->addr - pre_info_seg->vmaddr + pre_info_seg->fileoff))[kext_vmaddr + 1];
                     if (!(kext->kmod_addr & 0xFF00000000000000)) {
@@ -281,7 +442,7 @@ void init_kext_depends(KernelMacho& kernel, Kext* kext)
     Kext* depend_kext;
     while (depend_cld) {
         depend_kext = kernel.find_kext(depend_cld->GetText());
-        printf("....dep: %s, %p\n", depend_cld->GetText(), depend_kext);
+        printf("....dep: %s, %p\n", depend_cld->GetText(), static_cast<void*>(depend_kext));
         if (depend_kext == NULL) {
             printf("Not found kext depend %s\n", depend_cld->GetText());
             exit(1);
@@ -294,21 +455,16 @@ void init_kext_depends(KernelMacho& kernel, Kext* kext)
 
 Kext* load_kext_from_file(const char* path)
 {
-    char kext_dir[PATH_LENGTH];
-    const char* kext_name;
+    if (!path)
+        return nullptr;
+    std::string base(path);
+    size_t slash = base.find_last_of('/');
+    std::string kext_name = slash == std::string::npos ? base : base.substr(slash + 1);
+    std::string kext_dir = base + ".kext";
+    std::string kext_exec_path = kext_dir + "/" + kext_name;
+    std::string kext_info_path = kext_dir + "/Info.plist";
 
-    kext_name = strrchr(path, '/');
-    kext_name++;
-
-    sprintf(kext_dir, "%s.kext", path);
-
-    char kext_exec_path[PATH_LENGTH];
-    char kext_info_path[PATH_LENGTH];
-
-    sprintf(kext_exec_path, "%s/%s", kext_dir, kext_name);
-    sprintf(kext_info_path, "%s/Info.plist", kext_dir);
-
-    if (access(kext_info_path, F_OK)) {
+    if (access(kext_info_path.c_str(), F_OK)) {
         return NULL;
     }
 
@@ -316,28 +472,25 @@ Kext* load_kext_from_file(const char* path)
     Kext* kext = new Kext();
     kext->exec_macho = NULL;
     // Kext *kext = (Kext *)malloc(sizeof(Kext));
-    if (!access(kext_exec_path, F_OK)) {
-        KextMacho* kext_file = new KextMacho(kext_exec_path);
+    if (!access(kext_exec_path.c_str(), F_OK)) {
+        KextMacho* kext_file = new KextMacho(kext_exec_path.c_str());
         kext->is_from_file = true;
         kext->exec_macho = kext_file;
         kext_file->format_macho();
     }
 
     std::ifstream kext_info_fd(kext_info_path, std::ios::binary);
-    char* kext_info_buf = (char*)malloc(get_filesize(kext_info_fd));
-    kext_info_fd.read(kext_info_buf, get_filesize(kext_info_fd));
-    char* tmp_buf = kext_info_buf;
+    uint32_t kext_info_size = get_filesize(kext_info_fd);
+    std::vector<char> kext_info_buf(static_cast<size_t>(kext_info_size) + 1, '\0');
+    kext_info_fd.read(kext_info_buf.data(), kext_info_size);
 
     // tinyxml2 无法解析xml doctype定义，跳过这部分
-    while (*tmp_buf++) {
-        if (!strncmp(tmp_buf, "<dict>", 6)) {
-            break;
-        }
-    }
+    char* tmp_buf = strstr(kext_info_buf.data(), "<dict>");
+    if (!tmp_buf)
+        return NULL;
     if (kext->kextInfoDoc.Parse(tmp_buf)) {
         return NULL;
     }
-    free(kext_info_buf);
     kext_info_fd.close();
 
     kext->kextInfoElement = kext->kextInfoDoc.FirstChildElement();
@@ -362,5 +515,6 @@ uint32_t get_filesize(std::ifstream& fd)
 
 void useage()
 {
-    printf("kernelcache_patcher <your kernel> <iOS kernel> <symbol list> <your kexts path> <output filename> [iOS kernel patch list]\n");
+    printf("kernelcache_patcher <your kernel> <iOS kernel> <symbol list|auto|-> <your kexts path> <output filename> [iOS kernel patch list]\n");
+    printf("kernelcache_patcher analyze <your unstripped kernel> <iOS kernel> [iOS symbols.json] [--details]\n");
 }

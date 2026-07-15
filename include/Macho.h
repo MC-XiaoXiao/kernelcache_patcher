@@ -2,9 +2,11 @@
 
 #include <fstream>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_map>
 
 #define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
 #define SEG_ALIGN 1 << 6
@@ -323,18 +325,24 @@ private:
     uint32_t get_file_size();
 
 public:
-    char *file_buf;
-    uint32_t file_size;
-    mach_header_64_t *header;
+    char *file_buf = nullptr;
+    uint32_t file_size = 0;
+    mach_header_64_t *header = nullptr;
     bool is_64 = false;
     bool is_newer_ver = false;
-	uint32_t symbol_count;
+	uint32_t symbol_count = 0;
 	std::vector<Symbol *>symbol_list;
 	std::map<uint64_t, Symbol *> symbol_addr_map;
 	std::map<std::string, Symbol *> symbol_name_map;
+	std::unordered_map<std::string, Symbol *> symbol_alias_map;
+	std::deque<std::string> owned_symbol_names;
 
     virtual void format_macho();
     void init_symbols();
+    Symbol *add_symbol(uint64_t address, const std::string& name, bool overwrite = false);
+    Symbol *find_symbol_by_name(const std::string& name) const;
+    Symbol *find_symbol_by_addr(uint64_t address) const;
+    size_t load_symbols_json(const char *path, bool overwrite = false);
     void copy_from_file(uint64_t offset, char *targetBuff, size_t size);
     void *find_segment(const char *segment_name);
     void *find_section(const char *segname, const char *section_name);
@@ -342,6 +350,13 @@ public:
     bool addr_in_segment(segment_command_64_t *seg, uint64_t addr);
 	load_command *find_command(uint32_t cmd);
     uint32_t get_fileoff(uint64_t vmaddr);
+    bool vmaddr_to_fileoff(uint64_t vmaddr, uint64_t& fileoff, size_t size = 1) const;
+    bool read_u32_vm(uint64_t vmaddr, uint32_t& value) const;
+    bool read_u64_vm(uint64_t vmaddr, uint64_t& value) const;
+    bool read_cstring_vm(uint64_t vmaddr, std::string& value, size_t max_length = 256) const;
+    bool is_mapped_address(uint64_t vmaddr) const;
+    bool is_executable_address(uint64_t vmaddr) const;
+    std::vector<const segment_command_64_t*> segments() const;
 
 	Macho();
 	Macho(char *buf, uint32_t file_size);
