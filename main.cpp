@@ -62,7 +62,7 @@ static std::filesystem::path find_reference_root()
 static int analyze_resolver(int argc, char** argv)
 {
     if (argc < 4) {
-        printf("kernelcache_patcher analyze <local-unstripped-kernel> <release-kernel> [release-symbols.json]\n");
+        printf("kernelcache_patcher analyze <local-unstripped-kernel> <release-kernel> [release-symbols.json] [--native-only] [--details]\n");
         return 1;
     }
 
@@ -74,18 +74,21 @@ static int analyze_resolver(int argc, char** argv)
     source.init_symbols();
 
     bool details = false;
+    bool native_only = false;
     std::string symbols_path = std::string(argv[3]) + ".symbols.json";
     for (int i = 4; i < argc; ++i) {
         if (!strcmp(argv[i], "--details"))
             details = true;
+        else if (!strcmp(argv[i], "--native-only"))
+            native_only = true;
         else
             symbols_path = argv[i];
     }
-    size_t loaded = source.load_symbols_json(symbols_path.c_str());
+    size_t loaded = native_only ? 0 : source.load_symbols_json(symbols_path.c_str());
     printf("Loaded %zu release symbols from %s\n", loaded, symbols_path.c_str());
 
     CppClassAnalyzer cpp_analyzer(source, target);
-    CppAnalyzerStats cpp_stats = cpp_analyzer.recover();
+    CppAnalyzerStats cpp_stats = native_only ? CppAnalyzerStats{} : cpp_analyzer.recover();
     printf("Stripped C++ analyzer: %zu registrations, %zu instance vtables, %zu named slots, %zu symbols\n",
         cpp_stats.registrations, cpp_stats.classes_with_vtables, cpp_stats.named_virtual_slots,
         cpp_stats.injected_symbols);
@@ -95,13 +98,23 @@ static int analyze_resolver(int argc, char** argv)
     printf("Resolver: %zu named symbols, %zu vtables (%zu rejected), %zu virtual slots, %zu ambiguous addresses\n",
         stats.named_symbols, stats.matched_vtables, stats.rejected_vtables, stats.matched_vtable_slots,
         stats.ambiguous_addresses);
+    for (const VtableRejection& rejected : resolver.rejections()) {
+        printf("REJECT %s: %s, slot=%zu, source-vtable=0x%llx, target-vtable=0x%llx, source-slots=%zu, target-slots=%zu\n",
+            rejected.name.c_str(), rejected.reason.c_str(), rejected.slot,
+            static_cast<unsigned long long>(rejected.source_address),
+            static_cast<unsigned long long>(rejected.target_address), rejected.source_slots, rejected.target_slots);
+        printf("  source=0x%llx %s; target=0x%llx %s; expected=0x%llx\n",
+            static_cast<unsigned long long>(rejected.source_pointer), rejected.source_symbol.c_str(),
+            static_cast<unsigned long long>(rejected.target_pointer), rejected.target_symbol.c_str(),
+            static_cast<unsigned long long>(rejected.expected_pointer));
+    }
     if (details) {
         for (const RecoveredClass& recovered : cpp_analyzer.classes()) {
-            printf("class %s : %s, meta=0x%llx, registration=0x%llx, vtable=0x%llx, slots=%zu\n",
+            printf("class %s : %s, meta=0x%llx, registration=0x%llx, vtable=0x%llx, slots=%zu, instance-size=%u\n",
                 recovered.name.c_str(), recovered.super_name.empty() ? "<unknown>" : recovered.super_name.c_str(),
                 static_cast<unsigned long long>(recovered.meta_object),
                 static_cast<unsigned long long>(recovered.registration_call),
-                static_cast<unsigned long long>(recovered.vtable), recovered.slots.size());
+                static_cast<unsigned long long>(recovered.vtable), recovered.slots.size(), recovered.instance_size);
             if (recovered.registration_calls.size() > 1) {
                 printf("  registration calls:");
                 for (uint64_t call : recovered.registration_calls)
@@ -124,10 +137,200 @@ static int analyze_resolver(int argc, char** argv)
     return stats.matched_vtables ? 0 : 2;
 }
 
+static uint64_t normalize_macho_pointer(const Macho& image, uint64_t pointer)
+{
+    if (image.is_mapped_address(pointer))
+        return pointer;
+
+    // arm64e vtable entries can contain high PAC metadata.  Only accept the
+    // canonicalized value when it maps back into this Mach-O image.
+    uint64_t canonical = pointer & 0x0000ffffffffffffULL;
+    if (canonical & (1ULL << 47))
+        canonical |= 0xffff000000000000ULL;
+    return image.is_mapped_address(canonical) ? canonical : pointer;
+}
+
+static Symbol* relocation_symbol_at(const Macho& image, uint64_t address, bool& has_relocation)
+{
+    has_relocation = false;
+    if (!image.header || !image.is_64 || !image.file_buf)
+        return nullptr;
+
+    if (const auto* dysymtab = reinterpret_cast<const dysymtab_command*>(
+            const_cast<Macho&>(image).find_command(LC_DYSYMTAB))) {
+        auto scan_table = [&](uint32_t offset, uint32_t count) -> Symbol* {
+            const uint64_t bytes = static_cast<uint64_t>(count) * sizeof(relocation_info);
+            if (offset > image.file_size || bytes > image.file_size - offset)
+                return nullptr;
+            const auto* relocations = reinterpret_cast<const relocation_info*>(image.file_buf + offset);
+            for (uint32_t index = 0; index < count; ++index) {
+                const relocation_info& relocation = relocations[index];
+                if (relocation.r_address < 0
+                    || static_cast<uint64_t>(relocation.r_address) != address)
+                    continue;
+                has_relocation = true;
+                if (relocation.r_extern && relocation.r_symbolnum < image.symbol_list.size())
+                    return image.symbol_list[relocation.r_symbolnum];
+                return nullptr;
+            }
+            return nullptr;
+        };
+        if (Symbol* symbol = scan_table(dysymtab->extreloff, dysymtab->nextrel))
+            return symbol;
+        if (has_relocation)
+            return nullptr;
+        if (Symbol* symbol = scan_table(dysymtab->locreloff, dysymtab->nlocrel))
+            return symbol;
+        if (has_relocation)
+            return nullptr;
+    }
+
+    const load_command* command = reinterpret_cast<const load_command*>(image.header + 1);
+    for (uint32_t i = 0; i < image.header->ncmds; ++i) {
+        if (command->cmd == LC_SEGMENT_64) {
+            const auto* segment = reinterpret_cast<const segment_command_64_t*>(command);
+            const auto* section = reinterpret_cast<const section_64_t*>(segment + 1);
+            for (uint32_t section_index = 0; section_index < segment->nsects; ++section_index, ++section) {
+                if (address < section->addr || address >= section->addr + section->size)
+                    continue;
+                const uint64_t reloc_size = static_cast<uint64_t>(section->nreloc) * sizeof(relocation_info);
+                if (section->reloff > image.file_size || reloc_size > image.file_size - section->reloff)
+                    return nullptr;
+                const auto* relocations = reinterpret_cast<const relocation_info*>(image.file_buf + section->reloff);
+                const uint64_t section_offset = address - section->addr;
+                for (uint32_t reloc_index = 0; reloc_index < section->nreloc; ++reloc_index) {
+                    const relocation_info& relocation = relocations[reloc_index];
+                    // MH_OBJECT encodes a section-relative address, while the
+                    // MH_KEXT_BUNDLE files used here encode the image VM
+                    // address.  Accept either representation.
+                    if (relocation.r_address < 0
+                        || (static_cast<uint64_t>(relocation.r_address) != section_offset
+                            && static_cast<uint64_t>(relocation.r_address) != address))
+                        continue;
+                    has_relocation = true;
+                    if (relocation.r_extern && relocation.r_symbolnum < image.symbol_list.size())
+                        return image.symbol_list[relocation.r_symbolnum];
+                    return nullptr;
+                }
+                return nullptr;
+            }
+        }
+        command = reinterpret_cast<const load_command*>(
+            reinterpret_cast<const uint8_t*>(command) + command->cmdsize);
+    }
+    return nullptr;
+}
+
+static int dump_vtable(int argc, char** argv)
+{
+    if (argc < 4) {
+        printf("kernelcache_patcher dump-vtable <unstripped-macho> <vtable-symbol>\n");
+        return 1;
+    }
+
+    KextMacho image(argv[2]);
+    image.format_macho();
+    image.init_symbols();
+    Symbol* vtable = image.find_symbol_by_name(argv[3]);
+    if (!vtable || !vtable->symbol_addr) {
+        printf("Vtable symbol %s was not found\n", argv[3]);
+        return 2;
+    }
+
+    printf("%s at 0x%llx\n", argv[3],
+        static_cast<unsigned long long>(vtable->symbol_addr));
+    constexpr size_t kHeaderSlots = 2;
+    constexpr size_t kMaxSlots = 512;
+    size_t slots = 0;
+    for (; slots < kMaxSlots; ++slots) {
+        uint64_t pointer = 0;
+        uint64_t address = vtable->symbol_addr
+            + (kHeaderSlots + slots) * sizeof(uint64_t);
+        if (!image.read_u64_vm(address, pointer))
+            break;
+        bool has_relocation = false;
+        Symbol* relocation_symbol = relocation_symbol_at(image, address, has_relocation);
+        pointer = normalize_macho_pointer(image, pointer);
+        if (!relocation_symbol && !image.is_executable_address(pointer))
+            break;
+        Symbol* symbol = relocation_symbol ? relocation_symbol : image.find_symbol_by_addr(pointer);
+        printf("  [%3zu] 0x%llx %s\n", slots,
+            static_cast<unsigned long long>(pointer),
+            symbol && symbol->symbol_name ? symbol->symbol_name : "<unnamed>");
+    }
+    printf("%zu virtual slots\n", slots);
+    return slots ? 0 : 3;
+}
+
+static void write_json_string(std::ostream& output, const std::string& value)
+{
+    static const char digits[] = "0123456789abcdef";
+    output << '"';
+    for (unsigned char c : value) {
+        if (c == '"' || c == '\\') output << '\\' << static_cast<char>(c);
+        else if (c < 0x20) output << "\\u00" << digits[c >> 4] << digits[c & 15];
+        else output << static_cast<char>(c);
+    }
+    output << '"';
+}
+
+// Read-only structural ABI inventory. Selection and expectations belong to
+// caller-provided contracts, never to a hardcoded Kext or platform in this tool.
+static int inspect_abi(int argc, char** argv)
+{
+    if (argc != 5) {
+        fprintf(stderr, "inspect-abi <symbol-template> <provider-image> <output.json>\n");
+        return 1;
+    }
+    Macho local(argv[2]);
+    Macho native(argv[3]);
+    local.format_macho();
+    native.format_macho();
+    local.init_symbols();
+    native.init_symbols();
+    CppClassAnalyzer analyzer(native, local);
+    analyzer.recover();
+    std::ofstream output(argv[4]);
+    if (!output) return 1;
+    output << "{\"classes\":[";
+    bool first = true;
+    for (const auto& cls : analyzer.classes()) {
+        if (!first) output << ',';
+        first = false;
+        output << "{\"name\":";
+        write_json_string(output, cls.name);
+        output << ",\"super\":";
+        write_json_string(output, cls.super_name);
+        output << ",\"instance_size\":" << cls.instance_size
+            << ",\"vtable_slots\":" << cls.slots.size() << ",\"slots\":[";
+        for (size_t index = 0; index < cls.slots.size(); ++index) {
+            if (index) output << ',';
+            output << cls.slots[index];
+        }
+        output << "]}";
+    }
+    output << "],\"symbols\":{";
+    first = true;
+    for (const auto& entry : native.symbol_name_map) {
+        const auto* symbol = entry.second;
+        if (!symbol || !symbol->symbol_addr) continue;
+        if (!first) output << ',';
+        first = false;
+        write_json_string(output, entry.first);
+        output << ':' << symbol->symbol_addr;
+    }
+    output << "}}\n";
+    return output.good() ? 0 : 1;
+}
+
 int main(int argc, char** argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "inspect-abi"))
+        return inspect_abi(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "analyze"))
         return analyze_resolver(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "dump-vtable"))
+        return dump_vtable(argc, argv);
 
     if (argc < 6) {
         useage();
@@ -137,6 +340,10 @@ int main(int argc, char** argv)
     const char* your_kernel_path = argv[1];
     const char* ios_kernel_path = argv[2];
     const char* symbol_list_path = argv[3];
+    // @file is an explicit, audited symbol list. Unlike legacy symbol-list
+    // mode it must not pick up an unrelated <image>.symbols.json sidecar.
+    const bool exact_symbol_list = symbol_list_path[0] == '@';
+    if (exact_symbol_list) ++symbol_list_path;
     const char* kexts_path = argv[4];
     const char* output_path = argv[5];
     const char* ikernel_patch_list_path = argc > 6 ? argv[6] : nullptr;
@@ -158,7 +365,7 @@ int main(int argc, char** argv)
     i_kernel.format_macho();
     i_kernel.init_symbols();
     std::string automatic_symbols_path = std::string(ios_kernel_path) + ".symbols.json";
-    size_t automatic_symbols = strcmp(symbol_list_path, "-")
+    size_t automatic_symbols = !exact_symbol_list && strcmp(symbol_list_path, "-")
         ? i_kernel.load_symbols_json(automatic_symbols_path.c_str()) : 0;
     if (automatic_symbols)
         printf("Automatically loaded %zu release symbols from %s\n", automatic_symbols, automatic_symbols_path.c_str());
@@ -227,7 +434,8 @@ int main(int argc, char** argv)
         uint64_t addr = static_cast<uint64_t>(parsed_addr);
         i_kernel.add_symbol(addr, symbol_name, true);
 
-        // Personality-only bundles have no executable image.
+        // A collection may contain personality-only Kexts. Reuse the same
+        // bounded routing as recovered symbols; those bundles have no Mach-O.
         add_symbol_to_containing_kext({symbol_name, addr}, y_kernel.kexts);
     }
 
@@ -294,6 +502,10 @@ int main(int argc, char** argv)
     std::ofstream output_file_fs(output_path, std::ios::binary);
     output_file_fs.write(y_kernel.file_buf, y_kernel.file_size);
     output_file_fs.close();
+    if (!output_file_fs) {
+        fprintf(stderr, "Cannot write complete kernelcache: %s\n", output_path);
+        return 4;
+    }
 
     printf("Finish!\n");
 
@@ -488,6 +700,8 @@ uint32_t get_filesize(std::ifstream& fd)
 
 void useage()
 {
-    printf("kernelcache_patcher <your kernel> <iOS kernel> <symbol list|auto|-> <your kexts path> <output filename> [iOS kernel patch list]\n");
-    printf("kernelcache_patcher analyze <your unstripped kernel> <iOS kernel> [iOS symbols.json] [--details]\n");
+    printf("kernelcache_patcher <your kernel> <iOS kernel> <symbol list|@symbol list|auto|-> <your kexts path> <output filename> [iOS kernel patch list]\n");
+    printf("kernelcache_patcher analyze <your unstripped kernel> <iOS kernel> [iOS symbols.json] [--native-only] [--details]\n");
+    printf("kernelcache_patcher dump-vtable <unstripped Mach-O> <vtable symbol>\n");
+    printf("kernelcache_patcher inspect-abi <symbol-template> <provider-image> <output.json>\n");
 }
