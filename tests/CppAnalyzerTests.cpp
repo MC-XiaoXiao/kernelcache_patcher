@@ -16,8 +16,8 @@ struct TestImage {
     {
         auto* header = reinterpret_cast<mach_header_64_t*>(bytes.data());
         header->magic = MH_MAGIC_64;
-        header->ncmds = 1;
-        header->sizeofcmds = sizeof(segment_command_64_t);
+        header->ncmds = 2;
+        header->sizeofcmds = 2 * sizeof(segment_command_64_t);
 
         auto* text = reinterpret_cast<segment_command_64_t*>(header + 1);
         text->cmd = LC_SEGMENT_64;
@@ -28,6 +28,16 @@ struct TestImage {
         text->fileoff = 0x1000;
         text->filesize = 0x1000;
         text->initprot = 5;
+
+        auto* data = text + 1;
+        data->cmd = LC_SEGMENT_64;
+        data->cmdsize = sizeof(*data);
+        memcpy(data->segname, "__DATA_CONST", 12);
+        data->vmaddr = 0x3000;
+        data->vmsize = 0x800;
+        data->fileoff = 0x800;
+        data->filesize = 0x800;
+        data->initprot = 1;
 
         macho.format_macho();
     }
@@ -68,5 +78,28 @@ int main()
     CHECK(!cpp_analyzer_detail::find_abstract_structor_layout(
         image.macho, constructor, d2, d1, d0));
     CHECK(d2 == 0 && d1 == 0 && d0 == 0);
+
+    // A MetaClass vtable can directly follow the instance's metaClass and
+    // superClass globals in a modern cache. Do not mistake it for an instance.
+    auto* words = reinterpret_cast<uint64_t*>(image.bytes.data() + 0x900);
+    words[0] = 0x3500;
+    words[1] = 0x3600;
+    words[4] = 0x1100;
+    auto* instance = reinterpret_cast<uint64_t*>(image.bytes.data() + 0xa00);
+    instance[0] = 0x3500;
+    instance[1] = 0x3600;
+    instance[4] = 0x1120;
+    image.macho.add_symbol(0x3110, "__ZTVN4Test9MetaClassE");
+    uint64_t vtable = 0;
+    CHECK(cpp_analyzer_detail::find_instance_vtable(image.macho, "Test", 0x3500, 0x3600, vtable));
+    CHECK(vtable == 0x3210);
+
+    // An exported instance vtable also wins when the neighboring candidate
+    // has no name (the stripped MetaClass case).
+    TestImage unnamed;
+    memcpy(unnamed.bytes.data() + 0x900, image.bytes.data() + 0x900, 0x200);
+    unnamed.macho.add_symbol(0x3210, "__ZTV4Test");
+    CHECK(cpp_analyzer_detail::find_instance_vtable(unnamed.macho, "Test", 0x3500, 0x3600, vtable));
+    CHECK(vtable == 0x3210);
     return 0;
 }

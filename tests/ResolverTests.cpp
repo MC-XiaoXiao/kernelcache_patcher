@@ -82,6 +82,24 @@ int main()
     stats = rejected.build();
     CHECK(stats.matched_vtables == 0);
     CHECK(stats.rejected_vtables == 1);
+    CHECK(rejected.rejections().size() == 1);
+    CHECK(rejected.rejections()[0].reason == "named-anchor-mismatch");
+    CHECK(rejected.rejections()[0].slot == 0);
+    CHECK(rejected.rejections()[0].expected_pointer == 0xa000);
+    CHECK(rejected.rejections()[0].target_pointer == 0xa004);
     CHECK(!rejected.resolve(0x2004, result));
+    CHECK(!rejected.resolve(0x1100, result));
+
+    // Never map an equal prefix when the target has extra virtual methods.
+    TestImage longer_target(0xb000, 0xc000, 0xc000, 0xc004);
+    reinterpret_cast<uint64_t*>(longer_target.bytes.data() + 0x100)[4] = 0xc008;
+    LinkResolver count_mismatch(source.macho, longer_target.macho);
+    stats = count_mismatch.build();
+    CHECK(stats.rejected_vtables == 1);
+    CHECK(count_mismatch.rejections()[0].reason == "slot-count-mismatch");
+    CHECK(count_mismatch.rejections()[0].source_slots == 2);
+    CHECK(count_mismatch.rejections()[0].target_slots == 3);
+    CHECK(!count_mismatch.resolve(0x2004, result));
+    CHECK(!count_mismatch.resolve(0x1100, result));
     return 0;
 }

@@ -219,13 +219,30 @@ static MetaReferences index_meta_references(const Macho& image,
     return references;
 }
 
+static std::vector<uint64_t> read_vtable_slots(const Macho& image, uint64_t vtable);
+
 static bool find_instance_vtable(const Macho& image, const MetaReferences& references,
-    uint64_t meta_object, uint64_t super_meta, uint64_t& vtable)
+    const std::string& class_name, uint64_t meta_object, uint64_t super_meta, uint64_t& vtable)
 {
+    const std::string expected_name = "__ZTV" + itanium_type(class_name);
+    // Native exports are stronger evidence than adjacency to metaClass and
+    // superClass globals. Modern caches can place a MetaClass vtable there.
+    if (Symbol* exported = image.find_symbol_by_name(expected_name)) {
+        if (exported->symbol_addr && !read_vtable_slots(image, exported->symbol_addr).empty()) {
+            vtable = exported->symbol_addr;
+            return true;
+        }
+    }
     auto found = references.find(meta_object);
     if (found == references.end())
         return false;
     for (uint64_t address : found->second) {
+        if (Symbol* label = image.find_symbol_by_addr(address + 16)) {
+            const std::string name = label->symbol_name ? label->symbol_name : "";
+            if ((name.rfind("__ZTV", 0) == 0 || name.rfind("vtable for ", 0) == 0)
+                && name != expected_name && name != "vtable for " + class_name)
+                continue;
+        }
         uint64_t parent = 0, offset_to_top = 1, type_info = 1, first_method = 0;
         if (!image.read_u64_vm(address + 8, parent)
             || !image.read_u64_vm(address + 16, offset_to_top)
@@ -373,6 +390,13 @@ static std::vector<const Symbol*> symbols_at(const Macho& image, uint64_t addres
 
 } // namespace
 
+bool cpp_analyzer_detail::find_instance_vtable(const Macho& image, const std::string& class_name,
+    uint64_t meta_object, uint64_t super_meta, uint64_t& vtable)
+{
+    const auto references = index_meta_references(image, { meta_object });
+    return ::find_instance_vtable(image, references, class_name, meta_object, super_meta, vtable);
+}
+
 bool cpp_analyzer_detail::find_abstract_structor_layout(const Macho& image,
     uint64_t constructor, uint64_t& d2, uint64_t& d1, uint64_t& d0)
 {
@@ -418,7 +442,8 @@ void CppClassAnalyzer::add_symbol(uint64_t address, const std::string& name, Cpp
     if (!address || name.empty())
         return;
     Symbol* existing = source_.find_symbol_by_name(name);
-    if (existing && existing->symbol_addr == address)
+    // Never replace an existing export or signature with a positional guess.
+    if (existing && existing->symbol_addr)
         return;
     source_.add_symbol(address, name, true);
     symbols_.push_back({ name, address });
@@ -520,7 +545,7 @@ CppAnalyzerStats CppClassAnalyzer::recover()
 
     MetaReferences meta_references = index_meta_references(source_, seen_meta);
     for (RecoveredClass& recovered : classes_) {
-        find_instance_vtable(source_, meta_references, recovered.meta_object,
+        find_instance_vtable(source_, meta_references, recovered.name, recovered.meta_object,
             recovered.super_meta, recovered.vtable);
         if (recovered.vtable)
             recovered.slots = read_vtable_slots(source_, recovered.vtable);
@@ -622,6 +647,10 @@ CppAnalyzerStats CppClassAnalyzer::recover()
         if (!target_vtable_symbol || !target_vtable_symbol->symbol_addr)
             continue;
         std::vector<uint64_t> target_slots = read_vtable_slots(template_, target_vtable_symbol->symbol_addr);
+        // A different virtual count is direct layout evidence. Do not invent
+        // method names by index across that boundary (e.g. CONFIG_DTRACE).
+        if (recovered.slots.size() != target_slots.size())
+            continue;
         size_t common = std::min(recovered.slots.size(), target_slots.size());
         for (size_t slot = 0; slot < common; ++slot) {
             for (const Symbol* symbol : symbols_at(template_, target_slots[slot])) {

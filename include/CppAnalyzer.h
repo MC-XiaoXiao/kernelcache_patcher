@@ -37,6 +37,9 @@ struct CppAnalyzerStats {
 
 namespace cpp_analyzer_detail {
 
+bool find_instance_vtable(const Macho& image, const std::string& class_name,
+    uint64_t meta_object, uint64_t super_meta, uint64_t& vtable);
+
 // Validates the single-constructor layout emitted by
 // OSDefineMetaClassAndAbstractStructors and returns its destructor stubs.
 bool find_abstract_structor_layout(const Macho& image, uint64_t constructor,
