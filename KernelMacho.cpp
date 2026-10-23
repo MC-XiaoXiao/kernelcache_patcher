@@ -32,7 +32,7 @@ uint32_t KernelMacho::get_prelink_text_size()
                 size += ALIGN_UP(text_seg->vmsize, SEG_ALIGN);
             } else if (kext->exec_macho->header) {
                 if (kext->exec_macho->header->sizeofcmds) {
-                    size += ALIGN_UP(kext->exec_macho->header->sizeofcmds, SEG_ALIGN);
+                    size += ALIGN_UP(sizeof(mach_header_64_t) + kext->exec_macho->header->sizeofcmds, SEG_ALIGN);
                 }
             }
         }
@@ -49,6 +49,12 @@ uint32_t KernelMacho::get_prelink_segment_size(const char* seg_name, uint64_t al
         if (kext->exec_macho) {
             segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment(seg_name));
             if (text_exec_seg) {
+                // Keep each constant segment's original page offset. A single
+                // ADRP may address globals near both ends of one source page;
+                // packing at a different offset can split those consumers
+                // across two destination pages, which one ADRP cannot encode.
+                if (!strcmp(seg_name, "__DATA_CONST"))
+                    size = ALIGN_UP(size, 1 << 12) + (text_exec_seg->vmaddr & 0xfff);
                 size += ALIGN_UP(text_exec_seg->vmsize, align);
             }
         }
@@ -65,6 +71,7 @@ uint32_t KernelMacho::get_prelink_data_size(uint64_t align)
         if (kext->exec_macho) {
             segment_command_64_t* text_exec_seg = (segment_command_64_t*)(kext->exec_macho->find_segment("__DATA"));
             if (text_exec_seg) {
+                size = ALIGN_UP(size, 1 << 12) + (text_exec_seg->vmaddr & 0xfff);
                 size += ALIGN_UP(text_exec_seg->vmsize, align);
             } else if (kext->data_size) {
                 size += ALIGN_UP(kext->data_size, align);
