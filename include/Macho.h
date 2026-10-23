@@ -10,6 +10,8 @@
 
 #define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
 #define SEG_ALIGN 1 << 6
+// Coalesced protection boundaries must also work with 16 KiB software VM pages.
+#define ARM64_VM_PAGE_SIZE (1ULL << 14)
 
 #define IN_SEGMENT_RANGE(x, seg) (seg && ((x) >= (seg)->vmaddr && (x) < (seg)->vmaddr + (seg)->vmsize))
 

@@ -61,6 +61,7 @@ public:
     bool is_from_file = false;
 
     uint64_t text_off = 0;
+    uint64_t serialized_text_size = 0;
     uint64_t text_exec_off = 0;
     uint64_t data_off = 0;
 	uint32_t data_size = 0;

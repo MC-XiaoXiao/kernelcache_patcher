@@ -25,6 +25,12 @@ if(BUILD_TESTING)
     add_executable(structor_rebase_tests tests/StructorRebaseTests.cpp StructorRebase.cpp)
     target_compile_features(structor_rebase_tests PRIVATE cxx_std_17)
     add_test(NAME structor_rebase_tests COMMAND structor_rebase_tests)
+
+    add_executable(plist_tests tests/PlistTests.cpp Plist.cpp Macho.cpp KernelMacho.cpp Kext.cpp)
+    target_compile_features(plist_tests PRIVATE cxx_std_17)
+    target_link_libraries(plist_tests PRIVATE tinyxml2)
+    add_test(NAME plist_tests COMMAND plist_tests)
+
 endif()
 
 if(CMAKE_BUILD_TYPE  AND (CMAKE_BUILD_TYPE STREQUAL "Debug"))

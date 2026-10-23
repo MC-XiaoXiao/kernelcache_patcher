@@ -227,23 +227,8 @@ int main(int argc, char** argv)
         uint64_t addr = static_cast<uint64_t>(parsed_addr);
         i_kernel.add_symbol(addr, symbol_name, true);
 
-        for (auto kext : y_kernel.kexts) {
-            if (!kext->is_from_file) {
-                segment_command_64_t* kext_text_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__TEXT");
-                segment_command_64_t* kext_text_const_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__TEXT_EXEC");
-                segment_command_64_t* kext_data_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__DATA");
-                segment_command_64_t* kext_data_const_seg = (segment_command_64_t*)kext->exec_macho->find_segment("__DATA_CONST");
-                if (kext_text_seg) {
-                    if ((IN_SEGMENT_RANGE(addr, kext_text_seg))
-                        || (IN_SEGMENT_RANGE(addr, kext_text_const_seg))
-                        || (IN_SEGMENT_RANGE(addr, kext_data_seg))
-                        || (IN_SEGMENT_RANGE(addr, kext_data_const_seg))) {
-                        kext->exec_macho->add_symbol(addr, symbol_name, true);
-                        break;
-                    }
-                }
-            }
-        }
+        // Personality-only bundles have no executable image.
+        add_symbol_to_containing_kext({symbol_name, addr}, y_kernel.kexts);
     }
 
     CppClassAnalyzer cpp_analyzer(i_kernel, y_kernel);
@@ -316,31 +301,12 @@ int main(int argc, char** argv)
 }
 
 
-const char* kext_id_list[1000];
-
 void format_info_ids(XMLElement* kextsNode)
 {
-    if (kextsNode->ChildElementCount() > 0) {
-        XMLElement* tmpElement = kextsNode->FirstChildElement();
-        while (tmpElement) {
-            format_info_ids(tmpElement);
-            tmpElement = tmpElement->NextSiblingElement();
-        }
-    } else {
-        XMLElement* tmpElement = kextsNode;
-        if (tmpElement->Attribute("ID")) {
-            kext_id_list[tmpElement->IntAttribute("ID")] = tmpElement->GetText();
-            tmpElement->DeleteAttribute("ID");
-        } else if (tmpElement->Attribute("IDREF")) {
-            int id = tmpElement->IntAttribute("IDREF");
-            if (kext_id_list[id]) {
-                tmpElement->SetText(kext_id_list[id]);
-                tmpElement->DeleteAttribute("IDREF");
-            } else {
-                tmpElement->SetText("");
-                tmpElement->DeleteAttribute("IDREF");
-            }
-        }
+    std::string error;
+    if (!expand_plist_references(kextsNode, error)) {
+        fprintf(stderr, "Invalid prelink plist: %s\n", error.c_str());
+        exit(2);
     }
 }
 
@@ -361,19 +327,27 @@ void format_prelink_info(KernelMacho& kernel)
             memcpy(prelink_info_buf, (void*)((uint64_t)kernel.file_buf + pre_info_sect->offset), prelink_info_size);
 
             printf("Prelink info size: %x\n", prelink_info_size);
-            kernel.prlink_info_doc.Parse(prelink_info_buf);
+            kernel.prlink_info_doc.Parse(prelink_info_buf, prelink_info_size);
             if (kernel.prlink_info_doc.ErrorID()) {
                 printf("Error to parse prelink(%d)\n", kernel.prlink_info_doc.ErrorID());
+                free(prelink_info_buf);
+                exit(2);
             }
             free(prelink_info_buf);
 
             XMLElement* rootDict = kernel.prlink_info_doc.FirstChildElement("dict");
-            if (strcmp(rootDict->FirstChildElement("key")->GetText(), "_PrelinkInfoDictionary")) {
+            if (!rootDict || !rootDict->FirstChildElement("key")
+                || !rootDict->FirstChildElement("key")->GetText()
+                || strcmp(rootDict->FirstChildElement("key")->GetText(), "_PrelinkInfoDictionary")) {
                 printf("Prelink info not have _PrelinkInfoDictionary\n");
                 return;
             }
 
             XMLElement* rootArray = rootDict->FirstChildElement("array");
+            if (!rootArray) {
+                fprintf(stderr, "Prelink dictionary array is missing\n");
+                exit(2);
+            }
             XMLElement* kextNode = rootArray->FirstChildElement("dict");
             printf("iOS kernelcache has %d kexts\n", rootArray->ChildElementCount());
 
@@ -434,9 +408,13 @@ void format_prelink_info(KernelMacho& kernel)
 
 void init_kext_depends(KernelMacho& kernel, Kext* kext)
 {
-    XMLElement* depes_el = plist_get_item(kext->kextInfoElement, "OSBundleLibraries");
+    XMLElement* depes_el = plist_get_arch_item(kext->kextInfoElement, "OSBundleLibraries", "arm64");
     if (!depes_el)
         return;
+    if (strcmp(depes_el->Name(), "dict")) {
+        fprintf(stderr, "Invalid arm64 dependency dictionary for %s\n", kext->kext_id);
+        exit(1);
+    }
     XMLElement* depend_cld = depes_el->FirstChildElement("key");
 
     Kext* depend_kext;
@@ -457,49 +435,44 @@ Kext* load_kext_from_file(const char* path)
 {
     if (!path)
         return nullptr;
-    std::string base(path);
-    size_t slash = base.find_last_of('/');
-    std::string kext_name = slash == std::string::npos ? base : base.substr(slash + 1);
-    std::string kext_dir = base + ".kext";
-    std::string kext_exec_path = kext_dir + "/" + kext_name;
-    std::string kext_info_path = kext_dir + "/Info.plist";
-
-    if (access(kext_info_path.c_str(), F_OK)) {
-        return NULL;
-    }
-
-    // printf("Load KEXT %s\n", kext_name);
+    std::filesystem::path directory(path);
+    if (directory.extension() != ".kext") directory += ".kext";
+    bool contents = std::filesystem::is_regular_file(directory / "Contents/Info.plist");
+    auto info_path = directory / (contents ? "Contents/Info.plist" : "Info.plist");
+    if (!std::filesystem::is_regular_file(info_path)) return nullptr;
     Kext* kext = new Kext();
     kext->exec_macho = NULL;
-    // Kext *kext = (Kext *)malloc(sizeof(Kext));
-    if (!access(kext_exec_path.c_str(), F_OK)) {
-        KextMacho* kext_file = new KextMacho(kext_exec_path.c_str());
-        kext->is_from_file = true;
-        kext->exec_macho = kext_file;
-        kext_file->format_macho();
+    if (kext->kextInfoDoc.LoadFile(info_path.c_str()) != tinyxml2::XML_SUCCESS) {
+        fprintf(stderr, "Invalid XML Kext plist: %s\n", info_path.c_str());
+        exit(1);
     }
-
-    std::ifstream kext_info_fd(kext_info_path, std::ios::binary);
-    uint32_t kext_info_size = get_filesize(kext_info_fd);
-    std::vector<char> kext_info_buf(static_cast<size_t>(kext_info_size) + 1, '\0');
-    kext_info_fd.read(kext_info_buf.data(), kext_info_size);
-
-    // tinyxml2 无法解析xml doctype定义，跳过这部分
-    char* tmp_buf = strstr(kext_info_buf.data(), "<dict>");
-    if (!tmp_buf)
-        return NULL;
-    if (kext->kextInfoDoc.Parse(tmp_buf)) {
-        return NULL;
+    auto* root = kext->kextInfoDoc.FirstChildElement();
+    kext->kextInfoElement = root && !strcmp(root->Name(), "plist") ? root->FirstChildElement("dict") : root;
+    if (!kext->kextInfoElement || strcmp(kext->kextInfoElement->Name(), "dict")) {
+        fprintf(stderr, "Kext plist has no dictionary: %s\n", info_path.c_str());
+        exit(1);
     }
-    kext_info_fd.close();
-
-    kext->kextInfoElement = kext->kextInfoDoc.FirstChildElement();
-    if (!kext->kextInfoElement) {
-        return NULL;
-    }
-
     kext->kext_id = plist_get_string(kext->kextInfoElement, "CFBundleIdentifier");
-
+    const char* executable = plist_get_string(kext->kextInfoElement, "CFBundleExecutable");
+    if (!kext->kext_id || !kext->kext_id[0]) {
+        fprintf(stderr, "Kext plist has no bundle identifier: %s\n", info_path.c_str());
+        exit(1);
+    }
+    if (executable) {
+        std::filesystem::path leaf(executable);
+        if (leaf.empty() || leaf != leaf.filename() || leaf == "." || leaf == "..") {
+            fprintf(stderr, "Invalid Kext executable name: %s\n", executable);
+            exit(1);
+        }
+        auto executable_path = directory / (contents ? "Contents/MacOS" : "") / leaf;
+        if (!std::filesystem::is_regular_file(executable_path)) {
+            fprintf(stderr, "Missing declared Kext executable: %s\n", executable_path.c_str());
+            exit(1);
+        }
+        kext->exec_macho = new KextMacho(executable_path.c_str());
+        kext->exec_macho->format_macho();
+    }
+    kext->is_from_file = true;
     return kext;
 }
 
